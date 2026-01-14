@@ -1,0 +1,47 @@
+# Keil / MDK-ARM
+*.uvoptx
+*.uvguix
+*.uvprojx.tmp
+*.uvprojx.bak
+*.dep
+*.axf
+*.htm
+*.map
+*.crf
+*.d
+*.o
+*.lnp
+*.sct
+*.lst
+*.hex
+*.bin
+*.elf
+*.iex
+MDK-ARM/RTE
+MDK-ARM/DebugConfig
+MDK-ARM/Listings
+MDK-ARM/Objects
+
+# GCC / STM32CubeIDE
+Debug/
+Release/
+*.su
+*.mk
+*.list
+*.launch
+
+# VSCode / IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific
+Thumbs.db
+.DS_Store
+
+# Build artifacts
+build/
+*.pbi
+*.browse
+*.pbd
