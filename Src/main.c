@@ -34,6 +34,8 @@
 #include <string.h>
 #include "command_system.h"
 #include "commands_impl.h"
+#include "wm8978.h"
+#include "wavplay.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -262,6 +264,69 @@ int main(void)
 
   USB_Print("[BOOT] Initializing SD Card...\r\n");
   SD_Init_Process(); 
+
+  USB_Print("[BOOT] Initializing WM8978...\r\n");
+  
+  // Enable SAI MCLK output by starting transmission of dummy data
+  // WM8978 often needs MCLK to operate its internal digital logic (including I2C sometimes)
+  // Generate a simple square wave / beep for testing
+  // 48kHz sample rate, 16-bit stereo
+  static int16_t test_audio_buffer[100]; // 50 samples stereo
+  for(int i=0; i<100; i+=2) {
+      // Simple square wave
+      if (i < 50) {
+          test_audio_buffer[i] = 8000;   // Left
+          test_audio_buffer[i+1] = 8000; // Right
+      } else {
+          test_audio_buffer[i] = -8000;
+          test_audio_buffer[i+1] = -8000;
+      }
+  }
+
+  // Use DMA Circular mode so it plays continuously without while(1) intervention
+  if (HAL_SAI_Transmit_DMA(&hsai_BlockA1, (uint8_t*)test_audio_buffer, 100) != HAL_OK) {
+      USB_Print("[BOOT] SAI Transmit Start Failed!\r\n");
+  } else {
+      USB_Print("[BOOT] SAI MCLK Started. Playing test tone...\r\n");
+  }
+  HAL_Delay(10); // Wait for clock to stabilize
+
+  // I2C Scan
+  USB_Print("[I2C] Scanning I2C1 bus...\r\n");
+  for(uint16_t addr = 0; addr < 128; addr++) {
+      if(HAL_I2C_IsDeviceReady(&hi2c1, (addr << 1), 1, 10) == HAL_OK) {
+          USB_Print("[I2C] Found device at 0x%02X\r\n", addr);
+      }
+  }
+
+  if (WM8978_Init() == 0) {
+      USB_Print("[BOOT] WM8978 Init Success!\r\n");
+      WM8978_ADDA_Cfg(1, 0);      // Enable DAC, Disable ADC
+      // Force DAC Digital Volume to Max (+12dB)
+      // R11: DAC Control. 0xFF = +12dB (0dB is 0xC0)
+      WM8978_Write_Reg(11, 0xFF); 
+      
+      // Enable Speaker Boost (Optional, increases gain by 1.5x on some configs)
+      // R49: Output Control. TSDEN=1, SPKBOOST=1
+      uint16_t r49 = WM8978_Read_Reg(49);
+      WM8978_Write_Reg(49, r49 | (1 << 2)); // Bit 2 is SPKBOOST
+
+      WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
+      WM8978_Output_Cfg(1, 0);    // Enable DAC Output
+      WM8978_HPvol_Set(63, 63);   // Headphone Volume (Max 63)
+      WM8978_SPKvol_Set(63);      // Speaker Volume (Max 63)
+      // I2S Config will be handled by Wav_Play
+      
+      // Start Playing Music
+      if (Wav_Play("music.wav") == 0) {
+          USB_Print("[BOOT] Music playback started!\r\n");
+      } else {
+          USB_Print("[BOOT] Music playback failed to start.\r\n");
+      }
+  } else {
+      USB_Print("[BOOT] WM8978 Init Failed!\r\n");
+  }
+
   register_all_commands();
   /* USER CODE END 2 */
 
@@ -278,6 +343,11 @@ int main(void)
     }
     
     app_run_loop();
+    
+    // Process WAV double buffer filling
+    extern void Wav_Process(void);
+    Wav_Process();
+    
 //    
     Check_Power_Off();
 
@@ -601,7 +671,7 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
-  hsd1.Init.ClockDiv = 0; // 48MHz / (2+2) = 12MHz
+  hsd1.Init.ClockDiv = 0; // 48MHz / (4+2) = 8MHz (Stable for polling)
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
   /* USER CODE END SDMMC1_Init 2 */
