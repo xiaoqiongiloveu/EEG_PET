@@ -10,12 +10,20 @@
 #include "circular_buffer.h"
 #include "bsp_driver_sd.h"
 #include <string.h>
+#include "ad5933.h"
+#include <math.h>
+#include "wavplay.h"
 
 extern FATFS SDFatFS;
 extern FIL SDFile;
 extern CircularBuffer ADS1299_circula_buffer;
 extern uint8_t sd_mounted;
 extern USBD_HandleTypeDef hUsbDeviceFS;
+
+// External functions/variables from main.c
+extern float Battery_Voltage;
+extern void Update_Battery_Voltage(void);
+extern uint8_t wm8978_initialized;
 
 // Local file system objects
 static DIR dir;
@@ -30,6 +38,31 @@ static uint32_t last_save_time = 0;
 static uint32_t last_display_time = 0;
 static int current_sps = 250;
 static int current_channel = 1;
+
+// Impedance Calculation Variables
+static float imp_max_val = -1e9;
+static float imp_min_val = 1e9;
+static int imp_window_count = 0;
+static const int IMP_WINDOW_SIZE = 50; // 0.2s @ 250Hz (approx 1.5 cycles of 7.8Hz)
+
+// Noise Test Variables
+static double noise_sum[8];
+static double noise_sum_sq[8];
+static float noise_min[8];
+static float noise_max[8];
+
+// CMRR Test Variables
+static double cmrr_sum_sq[8];
+static const float CMRR_VIN_RMS = 0.7071f; // Assuming 2Vpp input = 0.7071 Vrms
+
+// CMRR Full Test Variables
+static double cmrr_step1_sum_sq[8]; // For Differential Gain
+static double cmrr_step2_sum_sq[8]; // For Common Mode Gain
+static double cmrr_diff_gain[8];    // Calculated Differential Gain
+
+// Impedance Test Statistics
+static double imp_sum = 0.0;
+static uint32_t imp_count = 0;
 
 /* Helper to check text file */
 static int is_txt_file(const char* filename) {
@@ -502,6 +535,56 @@ cmd_response_t cmd_quad_handler(char* args) {
     return response;
 }
 
+cmd_response_t cmd_stream_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: Acquisition already running");
+        return response;
+    }
+
+    int duration = 60 * 60; // 1 hour max
+    int sps = 250;
+    
+    current_sps = sps;
+    target_samples = duration * sps;
+
+    // Configure ADS1299
+    ADS1299_Stop();
+    ADS1299_Set_Sample_Parameter(6, 6, 0); // 250SPS, Gain 24, Normal Input 
+   
+    // Enable all 8 channels 
+    for(int i=1; i<=8; i++) { 
+       ADS1299_Write_Reg(0x04 + i, 0x60); // Gain 24, Normal Input 
+    } 
+   
+    USB_Print("\r\n[BOOT] ADS1299 Registers before START:\r\n"); 
+    uint8_t regs[24]; 
+    ADS1299_Read_Regs(0x00, regs, 24); 
+    for(int i=0; i<24; i++) { 
+       USB_Print("Reg[0x%02X] = 0x%02X\r\n", i, regs[i]); 
+       HAL_Delay(5); 
+    } 
+    
+    // Play 3.wav before starting collection
+    Wav_Play("AUDIO/3.wav");
+    while(is_playing) {
+        Wav_Process();
+    }
+    
+    ADS1299_Start();
+    circular_buffer_clear(&ADS1299_circula_buffer);
+
+    app_state = APP_STREAM_RUNNING;
+    start_time = HAL_GetTick();
+    sample_count = 0;
+    last_save_time = start_time;
+    last_display_time = start_time;
+
+    strcpy(response.message, "OK: STREAM(8CH) started.");
+    return response;
+}
+
 cmd_response_t cmd_stop_handler(char* args) {
     cmd_response_t response = {1, ""};
     if (app_state == APP_IDLE) {
@@ -523,11 +606,47 @@ void app_run_loop(void) {
             USB_Print("File closed.\r\n");
         }
         app_state = APP_IDLE;
+        
+        // Play 4.wav after stopping collection
+        Wav_Play("AUDIO/4.wav");
+        while(is_playing) {
+            Wav_Process();
+        }
+        
         USB_Print("Acquisition Stopped. Saved %lu samples.\r\n", sample_count);
         return;
     }
 
-    if (app_state == APP_SINGLE_RUNNING || app_state == APP_QUAD_RUNNING) {
+    if (app_state == APP_SINGLE_RUNNING || app_state == APP_QUAD_RUNNING || app_state == APP_STREAM_RUNNING || app_state == APP_IMP_TEST_RUNNING || app_state == APP_NOISE_TEST_RUNNING || app_state == APP_CMRR_TEST_RUNNING || app_state == APP_CMRR_STEP1_RUNNING || app_state == APP_CMRR_STEP2_RUNNING) 
+			{
+        
+        // --- AUX Data Handling (1Hz) for STREAM mode ---
+        if (app_state == APP_STREAM_RUNNING) {
+            static uint32_t last_aux_time = 0;
+            if (HAL_GetTick() - last_aux_time >= 1000) {
+                float acc[3], gyro[3];
+                // Read IMU
+                QMI8658_Read_XYZ(acc, gyro);
+                // Read Battery
+                Update_Battery_Voltage();
+                
+                // Send AUX Packet: AUX:accx,accy,accz,gyrox,gyroy,gyroz,vbat
+                // Note: QMI8658_Read_XYZ returns g for acc and dps for gyro.
+                // Assuming Send_AUX_Packet format from main.c reference:
+                // "AUX:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n"
+                char aux_line[128];
+                int aux_len = snprintf(aux_line, sizeof(aux_line), 
+                    "AUX:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n", 
+                    acc[0], acc[1], acc[2], 
+                    gyro[0], gyro[1], gyro[2], 
+                    Battery_Voltage);
+                CDC_Transmit_FS((uint8_t*)aux_line, aux_len);
+                
+                last_aux_time = HAL_GetTick();
+            }
+        }
+        // -----------------------------------------------
+
         // Check timeout
         if (sample_count >= target_samples) {
             app_state = APP_STOP_REQUESTED;
@@ -543,9 +662,177 @@ void app_run_loop(void) {
             int len = 0;
             
             // Gain 24, Vref=4.5V
-            float scale = 0.5364f / 24.0f; // 4.5 / (2^23 - 1) / 24
+            // 4.5V / (2^23 - 1) = 0.53644 uV (LSB at Gain=1)
+            // scale unit: uV / LSB
+            float scale = 0.5364f / 24.0f; 
 
-            if (app_state == APP_SINGLE_RUNNING) {
+            if (app_state == APP_CMRR_STEP1_RUNNING) {
+                // Step 1: Differential Gain
+                for(int i=0; i<8; i++) {
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    float voltage = (float)val * scale * 1e-6f; 
+                    cmrr_step1_sum_sq[i] += (double)(voltage * voltage);
+                }
+                if (sample_count >= target_samples - 1) {
+                    USB_Print("\r\n[STEP 1] Differential Gain Measurement Done.\r\n");
+                    USB_Print("CH | Vout_diff (uVrms) | Measured Gain\r\n");
+                    USB_Print("---|-------------------|--------------\r\n");
+                    const float Vin_diff_rms = 50.0e-6f * 0.7071f; // 50uVpp = 17.677 uVrms
+                    
+                    for(int i=0; i<8; i++) {
+                        double vout_rms = sqrt(cmrr_step1_sum_sq[i] / target_samples);
+                        cmrr_diff_gain[i] = vout_rms / Vin_diff_rms;
+                        USB_Print(" %d | %17.3f | %12.4f\r\n", i+1, vout_rms*1e6, cmrr_diff_gain[i]);
+                    }
+                    USB_Print("Now run TEST_CMRR_FULL:STEP2 with 2V Common Mode Signal.\r\n");
+                }
+            }
+            else if (app_state == APP_CMRR_STEP2_RUNNING) {
+                // Step 2: Common Mode Gain & Final Calculation
+                for(int i=0; i<8; i++) {
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    float voltage = (float)val * scale * 1e-6f; 
+                    cmrr_step2_sum_sq[i] += (double)(voltage * voltage);
+                }
+                if (sample_count >= target_samples - 1) {
+                    USB_Print("\r\n[STEP 2] Common Mode Gain Measurement Done.\r\n");
+                    USB_Print("=== Final CMRR Results ===\r\n");
+                    USB_Print("CH | Diff Gain | Comm Gain | CMRR (dB)\r\n");
+                    USB_Print("---|-----------|-----------|----------\r\n");
+                    const float Vin_comm_rms = 2.0f * 0.7071f; // 2Vpp = 0.7071 Vrms? Wait.
+                    // Assuming user input 2Vpp means 2V Peak-to-Peak. Vrms = 2 / (2*sqrt(2)) = 0.7071
+                    // Correct.
+                    
+                    for(int i=0; i<8; i++) {
+                        double vout_comm_rms = sqrt(cmrr_step2_sum_sq[i] / target_samples);
+                        double comm_gain = vout_comm_rms / 0.7071; // Vin_comm = 0.7071
+                        
+                        double cmrr_ratio = cmrr_diff_gain[i] / comm_gain;
+                        double cmrr_db = 20.0 * log10(cmrr_ratio);
+                        
+                        USB_Print(" %d | %9.2f | %9.2e | %9.2f\r\n", 
+                                  i+1, cmrr_diff_gain[i], comm_gain, cmrr_db);
+                    }
+                }
+            }
+            else if (app_state == APP_CMRR_TEST_RUNNING) {
+                for(int i=0; i<8; i++) {
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    float voltage = (float)val * scale * 1e-6f; // Convert uV to Volts for calculation
+                    
+                    // We care about AC signal magnitude (RMS)
+                    // Simple RMS calculation assuming mean is close to 0 or removed by HPF
+                    // For more accuracy, we should subtract mean first, but here we just sum squares
+                    cmrr_sum_sq[i] += (double)(voltage * voltage);
+                }
+
+                if (sample_count >= target_samples - 1) {
+                    USB_SendString("\r\n[TEST_CMRR] Analysis Result (Assuming Vin=0.707 Vrms):\r\n");
+                    USB_SendString("CH | Vout (uVrms) | CMRR (dB)\r\n");
+                    USB_SendString("---|--------------|----------\r\n");
+                    
+                    for(int i=0; i<8; i++) {
+                        double vout_rms = sqrt(cmrr_sum_sq[i] / target_samples);
+                        // CMRR = 20 * log10( (Gain * Vin) / Vout )
+                        // Gain = 24
+                        double ratio = (24.0 * CMRR_VIN_RMS) / vout_rms;
+                        double cmrr_db = 20.0 * log10(ratio);
+                        
+                        USB_Print(" %d | %12.3f | %8.2f\r\n", 
+                                  i+1, vout_rms * 1e6, cmrr_db);
+                    }
+                }
+            }
+            else if (app_state == APP_NOISE_TEST_RUNNING) {
+                for(int i=0; i<8; i++) {
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    float voltage = (float)val * scale;
+                    
+                    noise_sum[i] += voltage;
+                    noise_sum_sq[i] += (voltage * voltage);
+                    if (voltage < noise_min[i]) noise_min[i] = voltage;
+                    if (voltage > noise_max[i]) noise_max[i] = voltage;
+                }
+                
+                // Check if done (last sample)
+                if (sample_count >= target_samples - 1) { 
+                     USB_SendString("\r\n[TEST_NOISE] Analysis Result (uV):\r\n");
+                     USB_SendString("CH | Mean (Offset) | Noise (RMS) | P-P (Peak-to-Peak)\r\n");
+                     USB_SendString("---|---------------|-------------|-------------------\r\n");
+                     
+                     for(int i=0; i<8; i++) {
+                         double mean = noise_sum[i] / target_samples;
+                         double variance = (noise_sum_sq[i] / target_samples) - (mean * mean);
+                         if (variance < 0) variance = 0; 
+                         double rms_noise = sqrt(variance);
+                         float pp = noise_max[i] - noise_min[i];
+                         
+                         USB_Print(" %d | %13.3f | %11.3f | %17.3f\r\n", 
+                                   i+1, mean, rms_noise, pp);
+                     }
+                }
+            }
+            else if (app_state == APP_IMP_TEST_RUNNING) {
+                // Impedance Test Logic (CH1 only for now)
+                int ch_offset = 3 + (current_channel - 1) * 3;
+                int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                if (val & 0x800000) val |= 0xFF000000;
+                float voltage = (float)val * scale; // Voltage in uV
+
+                // Debug: Print Raw Hex and Voltage periodically
+                // Every 10th sample to avoid flooding too much, but enough to see
+                if (imp_window_count % 10 == 0) {
+                     len = snprintf(line, sizeof(line), "DBG: Hex=0x%06X, Val=%ld, Volts=%.2f uV\r\n", 
+                                    (unsigned int)(val & 0xFFFFFF), (long)val, voltage);
+                     CDC_Transmit_FS((uint8_t*)line, len);
+                }
+
+                // Update Max/Min
+                if (voltage > imp_max_val) imp_max_val = voltage;
+                if (voltage < imp_min_val) imp_min_val = voltage;
+                imp_window_count++;
+
+                // Calculate Impedance periodically
+                if (imp_window_count >= IMP_WINDOW_SIZE) {
+                    float vpp = imp_max_val - imp_min_val; // Peak-to-Peak Voltage (in uV)
+                    
+                    // Z = Vpp(uV) * 1e-6 / (2 * I_inj)
+                    // I_inj = 6nA = 6e-9 A (Configured via LOFF reg 0x01 -> ILEAD_OFF=00 -> 6nA)
+                    // Z = Vpp(uV) * 1e-6 / 12e-9 = Vpp(uV) / 0.012
+                    float raw_impedance = (vpp * 1e-6f) / (2.0f * 6.0e-9f);
+                    
+                    // No calibration, use raw impedance
+                    float impedance = raw_impedance;
+                    
+                    len = snprintf(line, sizeof(line), "Z: %.2f kOhm (Vpp: %.2f uV)\r\n", 
+                                   impedance / 1000.0f, vpp);
+                    CDC_Transmit_FS((uint8_t*)line, len);
+
+                    // Accumulate for average
+                    imp_sum += impedance;
+                    imp_count++;
+
+                    // Reset for next window
+                    imp_max_val = -1e9;
+                    imp_min_val = 1e9;
+                    imp_window_count = 0;
+                }
+                
+                if (sample_count >= target_samples - 1 && imp_count > 0) {
+                    double avg_imp = imp_sum / imp_count;
+                    len = snprintf(line, sizeof(line), "\r\n[TEST_IMP] Average Impedance: %.2f kOhm\r\n", avg_imp / 1000.0);
+                    CDC_Transmit_FS((uint8_t*)line, len);
+                }
+            }
+            else if (app_state == APP_SINGLE_RUNNING) {
                 int ch_offset = 3 + (current_channel - 1) * 3;
                 int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
                 if (val & 0x800000) val |= 0xFF000000;
@@ -553,6 +840,21 @@ void app_run_loop(void) {
                 
                 len = snprintf(line, sizeof(line), "%.2f\n", voltage);
                 // Note: SINGLE mode currently does not write to SD, as requested only for QUAD
+                CDC_Transmit_FS((uint8_t*)line, len);
+            } else if (app_state == APP_STREAM_RUNNING) {
+                float voltages[8];
+                for(int i=0; i<8; i++) {
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    voltages[i] = (float)val * scale;
+                }
+                
+                // Format: EEG:v1,v2,v3,v4,v5,v6,v7,v8\n
+                len = snprintf(line, sizeof(line), "EEG:F5:%.2f,F3:%.2f,FZ:%.2f,F4:%.2f,F6:%.2f,AF8:%.2f,FPZ:%.2f,AF7:%.2f\r\n",
+                               voltages[0], voltages[1], voltages[2], voltages[3],
+                               voltages[4], voltages[5], voltages[6], voltages[7]);
+                
                 CDC_Transmit_FS((uint8_t*)line, len);
             } else {
                 // QUAD (8-channel) mode
@@ -583,9 +885,6 @@ void app_run_loop(void) {
                         f_sync(&SDFile);
                     }
                 }
-                
-                // Optional: Monitor via USB (can be removed if too slow)
-                // CDC_Transmit_FS((uint8_t*)line, len); 
             }
 
             sample_count++;
@@ -640,11 +939,402 @@ cmd_response_t cmd_reg_handler(char* args) {
     return response;
 }
 
+cmd_response_t cmd_sweep_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: App busy");
+        return response;
+    }
+
+    USB_Print("[CMD] Starting AD5933 Sweep...\r\n");
+    AD5933_Sweep();
+    
+    strcpy(response.message, "OK: Sweep Completed");
+    return response;
+}
+
+cmd_response_t cmd_test_imp_handler(char* args) {
+    cmd_response_t response = {1, ""};
+
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: Acquisition already running");
+        return response;
+    }
+
+    ADS1299_Stop();
+    HAL_Delay(10);
+
+    // Manual Register Configuration for Impedance Test
+    ADS1299_Write_Reg(0x00, 0x3E); // ID Control (Read Only, but user asked to set it?) - Actually ID is RO, usually 0x3E for ADS1299
+    ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: Daisy-chain disable, oscillator clock output disable, 250 SPS
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal test signal generation
+    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: Internal reference buffer enabled, VREF = 4.5V
+    ADS1299_Write_Reg(0x04, 0x01); // LOFF: 24nA Current, AC Lead-off at fDR/4 (000 0 01 01)
+
+    // CHnSET: 0x60 = Gain 24, Normal Input; 0x80 = Gain 24, Input Shorted? No, 0x80 is powered down?
+    // Wait, 0x80 = 1000 0000 -> PD=1 (Power Down), GAIN=1 (1), MUX=0 (Normal) -> Power Down
+    // 0x60 = 0110 0000 -> PD=0 (Active), GAIN=24 (110), MUX=0 (Normal)
+    ADS1299_Write_Reg(0x05, 0x60); // CH1: Active, Gain 24, Normal Input
+    ADS1299_Write_Reg(0x06, 0x80); // CH2: Power Down
+    ADS1299_Write_Reg(0x07, 0x80); // CH3: Power Down
+    ADS1299_Write_Reg(0x08, 0x80); // CH4: Power Down
+    ADS1299_Write_Reg(0x09, 0x80); // CH5: Power Down
+    ADS1299_Write_Reg(0x0A, 0x80); // CH6: Power Down
+    ADS1299_Write_Reg(0x0B, 0x80); // CH7: Power Down
+    ADS1299_Write_Reg(0x0C, 0x80); // CH8: Power Down
+
+    ADS1299_Write_Reg(0x0D, 0x00); // BIAS_SENSP
+    ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
+    ADS1299_Write_Reg(0x0F, 0x01); // LOFF_SENSP: LOFF8P? No, 0x01 is LOFF1P enabled
+    ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
+    ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
+    ADS1299_Write_Reg(0x12, 0x00); // LOFF_STATP (RO)
+    ADS1299_Write_Reg(0x13, 0x00); // LOFF_STATN (RO)
+    ADS1299_Write_Reg(0x14, 0x00); // GPIO
+    ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1 connected to all N inputs (closed)
+    ADS1299_Write_Reg(0x16, 0x00); // MISC2
+    ADS1299_Write_Reg(0x17, 0x02); // CONFIG4: PD_LOFF_COMP enabled (Lead-Off Comparator Enabled)
+
+    USB_Print("[TEST_IMP] Registers Configured.\r\n");
+		
+    USB_Print("\r\n[BOOT] ADS1299 Registers before START:\r\n");
+		uint8_t regs[24];
+		ADS1299_Read_Regs(0x00, regs, 24);
+		for(int i=0; i<24; i++) {
+				USB_Print("Reg[0x%02X] = 0x%02X\r\n", i, regs[i]);
+				HAL_Delay(5);
+		}
+
+    // Start Acquisition
+    ADS1299_Start();
+    circular_buffer_clear(&ADS1299_circula_buffer);
+
+    app_state = APP_IMP_TEST_RUNNING; 
+    start_time = HAL_GetTick();
+    sample_count = 0;
+    target_samples = 60 * 250; // Run for 1 minute
+    last_display_time = start_time;
+    current_channel = 1; // Focus on Channel 1
+
+    // Reset Impedance Stats
+    imp_max_val = -1e9;
+    imp_min_val = 1e9;
+    imp_window_count = 0;
+    imp_sum = 0.0;
+    imp_count = 0;
+
+    strcpy(response.message, "OK: TEST_IMP Started (CH1)");
+    return response;
+}
+
+cmd_response_t cmd_test_noise_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: App busy");
+        return response;
+    }
+
+    ADS1299_Stop();
+    HAL_Delay(10);
+
+    // 1. Configure Registers
+    // 0x00 is Read Only
+    ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal Test Signal On
+    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: Ref Buffer Enabled, VRef 4.5V
+    ADS1299_Write_Reg(0x04, 0x00); // LOFF: Disabled
+
+    // CH1-CH8: Gain 24, Input Shorted (0x61)
+    for(int i=1; i<=8; i++) {
+        ADS1299_Write_Reg(0x04 + i, 0x61); 
+    }
+    
+    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: All enabled
+    ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
+    ADS1299_Write_Reg(0x0F, 0x00); // LOFF_SENSP
+    ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
+    ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
+    ADS1299_Write_Reg(0x12, 0x00); // LOFF_STATP (RO)
+    ADS1299_Write_Reg(0x13, 0x00); // LOFF_STATN (RO)
+    ADS1299_Write_Reg(0x14, 0x00); // GPIO
+    ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1
+    ADS1299_Write_Reg(0x16, 0x00); // MISC2
+    ADS1299_Write_Reg(0x17, 0x00); // CONFIG4
+
+    USB_Print("[TEST_NOISE] Registers Configured.\r\n");
+
+    // 2. Read Back and Print
+    USB_Print("\r\n[BOOT] ADS1299 Registers after Config:\r\n");
+    uint8_t regs[24];
+    ADS1299_Read_Regs(0x00, regs, 24);
+    for(int i=0; i<24; i++) {
+        USB_Print("Reg[0x%02X] = 0x%02X\r\n", i, regs[i]);
+        HAL_Delay(5);
+    }
+
+    // 3. Init Variables
+    for(int i=0; i<8; i++) {
+        noise_sum[i] = 0.0;
+        noise_sum_sq[i] = 0.0;
+        noise_min[i] = 1e9;
+        noise_max[i] = -1e9;
+    }
+
+    // 4. Start Acquisition
+    ADS1299_Start();
+    circular_buffer_clear(&ADS1299_circula_buffer);
+
+    app_state = APP_NOISE_TEST_RUNNING;
+    start_time = HAL_GetTick();
+    sample_count = 0;
+    target_samples = 250; // 1 second @ 250SPS
+    last_display_time = start_time;
+
+    strcpy(response.message, "OK: TEST_NOISE started (1 sec)");
+    return response;
+}
+
+cmd_response_t cmd_test_cmrr_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: App busy");
+        return response;
+    }
+
+    ADS1299_Stop();
+    HAL_Delay(10);
+
+    USB_Print("[TEST_CMRR] Please ensure 2Vpp Common Mode signal is applied to all inputs.\r\n");
+
+    // 1. Configure Registers
+    // 0x00 is Read Only (ID)
+    ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Int Test Signal ON (Internal)
+    ADS1299_Write_Reg(0x03, 0xF6); // CONFIG3: VREF=4.5V, RLDREF_INT=1, PD_RLD=1, RLD_MEAS=1
+    ADS1299_Write_Reg(0x04, 0x00); // LOFF: Disabled
+
+    // CH1-CH8: Gain 24, Normal Input (0x60)
+    for(int i=1; i<=8; i++) {
+        ADS1299_Write_Reg(0x04 + i, 0x60); 
+    }
+    
+    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: All enabled
+    ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
+    ADS1299_Write_Reg(0x0F, 0x00); // LOFF_SENSP
+    ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
+    ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
+    ADS1299_Write_Reg(0x12, 0x00); // LOFF_STATP (RO)
+    ADS1299_Write_Reg(0x13, 0x00); // LOFF_STATN (RO)
+    ADS1299_Write_Reg(0x14, 0x00); // GPIO
+    ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1
+    ADS1299_Write_Reg(0x16, 0x00); // MISC2
+    ADS1299_Write_Reg(0x17, 0x00); // CONFIG4
+
+    USB_Print("[TEST_CMRR] Registers Configured.\r\n");
+
+    // 2. Read Back and Print
+    USB_Print("\r\n[BOOT] ADS1299 Registers after Config:\r\n");
+    uint8_t regs[24];
+    ADS1299_Read_Regs(0x00, regs, 24);
+    for(int i=0; i<24; i++) {
+        USB_Print("Reg[0x%02X] = 0x%02X\r\n", i, regs[i]);
+        HAL_Delay(5);
+    }
+
+    // 3. Init Variables
+    for(int i=0; i<8; i++) {
+        cmrr_sum_sq[i] = 0.0;
+    }
+
+    // 4. Start Acquisition
+    ADS1299_Start();
+    circular_buffer_clear(&ADS1299_circula_buffer);
+
+    app_state = APP_CMRR_TEST_RUNNING;
+    start_time = HAL_GetTick();
+    sample_count = 0;
+    target_samples = 500; // 2 seconds @ 250SPS
+    last_display_time = start_time;
+    
+    strcpy(response.message, "OK: TEST_CMRR started (2 sec)");
+    return response;
+}
+
+cmd_response_t cmd_test_cmrr_full_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: App busy");
+        return response;
+    }
+
+    if (args != NULL && strcmp(args, "STEP1") == 0) {
+        // STEP 1: Differential Gain Test
+        // Requires: 4mV Diff Signal
+        USB_Print("[TEST_CMRR_FULL] STEP 1: Measuring Differential Gain.\r\n");
+        USB_Print("Please Apply 4mV (1.414 mVrms) Differential Signal to all channels.\r\n");
+
+        ADS1299_Stop();
+        HAL_Delay(10);
+        
+        // Config for Normal Input (Gain 24)
+        ADS1299_Write_Reg(0x01, 0x96); 
+        ADS1299_Write_Reg(0x02, 0xC0); 
+        ADS1299_Write_Reg(0x03, 0xF6); 
+        ADS1299_Write_Reg(0x04, 0x00); 
+
+        for(int i=1; i<=8; i++) ADS1299_Write_Reg(0x04 + i, 0x60); 
+        
+        ADS1299_Write_Reg(0x0D, 0xFF); 
+        ADS1299_Write_Reg(0x0E, 0x00); 
+        ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1 connected to all N inputs
+        
+        // Init Vars
+        for(int i=0; i<8; i++) cmrr_step1_sum_sq[i] = 0.0;
+        
+        ADS1299_Start();
+        circular_buffer_clear(&ADS1299_circula_buffer);
+        
+        app_state = APP_CMRR_STEP1_RUNNING;
+        start_time = HAL_GetTick();
+        sample_count = 0;
+        target_samples = 500; // 2 sec
+        
+        strcpy(response.message, "OK: STEP1 Started");
+    } 
+    else if (args != NULL && strcmp(args, "STEP2") == 0) {
+        // STEP 2: Common Mode Gain Test
+        // Requires: 2V Comm Signal
+        USB_Print("[TEST_CMRR_FULL] STEP 2: Measuring Common Mode Gain.\r\n");
+        USB_Print("Please Apply 2V (0.7071 Vrms) Common Mode Signal to all channels.\r\n");
+        
+        ADS1299_Stop();
+        HAL_Delay(10);
+        
+        // Same Config
+        ADS1299_Write_Reg(0x01, 0x96); 
+        ADS1299_Write_Reg(0x02, 0xC0); 
+        ADS1299_Write_Reg(0x03, 0xF6); 
+        ADS1299_Write_Reg(0x04, 0x00); 
+        for(int i=1; i<=8; i++) ADS1299_Write_Reg(0x04 + i, 0x60); 
+        ADS1299_Write_Reg(0x0D, 0xFF); 
+        ADS1299_Write_Reg(0x0E, 0x00); 
+        ADS1299_Write_Reg(0x15, 0x20);
+
+        // Init Vars
+        for(int i=0; i<8; i++) cmrr_step2_sum_sq[i] = 0.0;
+        
+        ADS1299_Start();
+        circular_buffer_clear(&ADS1299_circula_buffer);
+        
+        app_state = APP_CMRR_STEP2_RUNNING;
+        start_time = HAL_GetTick();
+        sample_count = 0;
+        target_samples = 500; // 2 sec
+        
+        strcpy(response.message, "OK: STEP2 Started");
+    }
+    else {
+        response.success = 0;
+        strcpy(response.message, "ERR: Usage: TEST_CMRR_FULL:STEP1 or STEP2");
+    }
+
+    return response;
+}
+
+cmd_response_t cmd_get_state_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    (void)args;
+
+    // Update battery voltage reading before reporting
+    Update_Battery_Voltage();
+
+    // Check ADS1299 ID
+    uint8_t ads_id = ADS1299_ReadRegister(0x00);
+    int ads_ok = ((ads_id & 0x1F) == 0x1E) ? 1 : 0; // ADS1299 ID is typically 0x3E (rev+ID)
+
+    // Check USB State
+    int usb_ok = (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) ? 1 : 0;
+
+    USB_Print("\r\n=== DEVICE STATE REPORT ===\r\n");
+    USB_Print("SN: AIT2601X04567\r\n");
+    USB_Print("VERSION:T1.0.0\r\n");
+    USB_Print("Battery: %.1f%%\r\n", Battery_Voltage);
+    USB_Print("USB:     %s\r\n", usb_ok ? "CONNECTED" : "DISCONNECTED");
+    USB_Print("Charging:  %s\r\n", usb_ok ? "CHARGING" : "DISCHARGING");
+    USB_Print("SD Card: %s\r\n", sd_mounted ? "MOUNTED" : "NOT MOUNTED");
+    USB_Print("ADS1299: %s (ID: 0x%02X)\r\n", ads_ok ? "OK" : "ERROR", ads_id);
+    USB_Print("WM8978:  %s\r\n", wm8978_initialized ? "OK" : "ERROR");
+    
+    // Detailed ADS1299 Registers (Optional, keep it concise or expand if needed)
+    // For now just ID status is good for "State"
+    
+    USB_Print("=== END REPORT ===\r\n");
+
+    strcpy(response.message, "OK: State report sent");
+    return response;
+}
+
+cmd_response_t cmd_playmusic_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    if (args == NULL || args[0] == '\0') {
+        response.success = 0;
+        strcpy(response.message, "ERR: Missing filename");
+        return response;
+    }
+    
+    // Check if other app is running
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: App busy");
+        return response;
+    }
+
+    char path[128];
+    // If user provides "1", make it "AUDIO/1.wav"
+    // If user provides "1.wav", make it "AUDIO/1.wav"
+    
+    // Trim spaces
+    while (*args == ' ') args++;
+    
+    USB_Print("[CMD] PLAYMUSIC args: '%s'\r\n", args);
+
+    // Construct path
+    if (strstr(args, ".wav") || strstr(args, ".WAV")) {
+        sprintf(path, "AUDIO/%s", args);
+    } else {
+        sprintf(path, "AUDIO/%s.wav", args);
+    }
+    
+    USB_Print("[CMD] Playing path: '%s'\r\n", path);
+
+    wav_loop_mode = 0; // Play once
+    
+    uint8_t res = Wav_Play(path);
+    if (res == 0) {
+        sprintf(response.message, "OK: Playing %s", path);
+    } else {
+        response.success = 0;
+        sprintf(response.message, "ERR: Play failed (%d)", res);
+    }
+    
+    return response;
+}
+
 void register_all_commands(void) {
   command_system_init();
 
   register_command("LIST", cmd_list_handler, "LIST", "List all .txt files");
   register_command("GET", cmd_get_handler, "GET:<filename>", "Send file");
+  register_command("STATE", cmd_get_state_handler, "STATE", "Report device initialization state");
   register_command("DIAG", cmd_diag_handler, "DIAG", "SD card diagnosis");
   register_command("HELP", cmd_help_handler, "HELP", "Display command help");
   register_command("CREATELARGE", cmd_createlarge_handler, "CREATELARGE", "Create large test file");
@@ -653,8 +1343,15 @@ void register_all_commands(void) {
 
   register_command("SINGLE", cmd_single_handler, "SINGLE", "Single channel acquisition (1 min)");
   register_command("QUAD", cmd_quad_handler, "QUAD", "4 channel acquisition (1 min)");
+  register_command("STREAM", cmd_stream_handler, "STREAM", "8 channel stream (1 hour)");
   register_command("STOP", cmd_stop_handler, "STOP", "Stop acquisition");
   register_command("REG", cmd_reg_handler, "REG", "Read ADS1299 registers");
+  register_command("SWEEP", cmd_sweep_handler, "SWEEP", "AD5933 Freq Sweep");
+  register_command("TEST_IMP", cmd_test_imp_handler, "TEST_IMP", "Test Impedance Config");
+  register_command("TEST_NOISE", cmd_test_noise_handler, "TEST_NOISE", "Internal noise test");
+  register_command("TEST_CMRR", cmd_test_cmrr_handler, "TEST_CMRR", "CMRR test");
+  register_command("TEST_CMRR_FULL", cmd_test_cmrr_full_handler, "TEST_CMRR_FULL:<STEP1|STEP2>", "Full CMRR Test (Two Pass)");
+  register_command("PLAYMUSIC", cmd_playmusic_handler, "PLAYMUSIC:<filename>", "Play .wav file in AUDIO folder (e.g. PLAYMUSIC:1)");
 
-  USB_Print("[CMD] Command system: Registered %d commands\r\n", 10);
+    // USB_Print("[CMD] Command system: Registered %d commands\r\n", 15);
 }

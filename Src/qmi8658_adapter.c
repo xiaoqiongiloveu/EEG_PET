@@ -448,6 +448,12 @@ static void QMI8658_Read_Sensor_Data(float *acc, float *gyro)
 
     if (g_imu_init != 1)
     {
+        // Zero out output during calibration to prevent garbage values
+        for (axis = 0; axis < 3; axis++) {
+            acc[axis] = 0.0f;
+            gyro[axis] = 0.0f;
+        }
+
         if (cali_count == 0)
         {
             memset((void *)accel_calibration_sum, 0, sizeof(accel_calibration_sum));
@@ -484,6 +490,12 @@ static void QMI8658_Read_Sensor_Data(float *acc, float *gyro)
         {
             acc[axis] = acc_raw[axis] + offset_acc[axis];
             gyro[axis] = gyro_raw[axis] + offset_gyro[axis];
+            
+            // Limit check
+            if (acc[axis] > 200.0f) acc[axis] = 200.0f;
+            if (acc[axis] < -200.0f) acc[axis] = -200.0f;
+            if (gyro[axis] > 20000.0f) gyro[axis] = 20000.0f;
+            if (gyro[axis] < -20000.0f) gyro[axis] = -20000.0f;
         }
     }
 }
@@ -563,6 +575,15 @@ uint8_t QMI8658_Init(void)
     
     QMI8658_Config_Reg(0);                      /* Configure Sensors */
     QMI8658_EnableSensors(g_imu.cfg.ensensors); /* Enable Sensors */
+
+    /* Perform fast calibration immediately after init */
+    /* This prevents waiting 100 seconds in 1Hz low-speed sampling modes */
+    float acc[3], gyro[3];
+    for(int i = 0; i <= MAX_CALI_COUNT + 10; i++)
+    {
+        QMI8658_Read_XYZ(acc, gyro);
+        delay_ms(2); // Wait for next sample (500Hz ODR = 2ms)
+    }
 
     return 0;
 }

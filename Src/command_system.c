@@ -134,6 +134,11 @@ cmd_response_t process_command_ex(char* input) {
 
     response = cmd->handler(args);
     
+    // Print response message to USB if exists
+    if (response.message[0] != '\0') {
+        USB_Print("%s\r\n", response.message);
+    }
+
     return response;
 }
 
