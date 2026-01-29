@@ -9,10 +9,21 @@ extern void USB_Print(const char* format, ...);
 
 __wavctrl wavctrl;
 FIL wav_file;
-uint8_t wav_dma_buffer[WAV_DMA_BUFFER_SIZE]; // Double Buffer logic handled by HAL
+
+// Double Buffer for DMA (16-bit Stereo samples)
+// If playing 24-bit, we might need to adjust, but let's assume 16-bit for now as base case.
+uint8_t wav_dma_buffer[WAV_DMA_BUFFER_SIZE]; 
+
+// Temp Buffer for reading from SD card (Half size of DMA buffer is enough usually, 
+// but if expanding mono->stereo, we need read buffer to be smaller)
+// Let's define a read buffer size.
+#define WAV_READ_BUFFER_SIZE (WAV_DMA_BUFFER_SIZE / 2)
+uint8_t wav_read_buffer[WAV_READ_BUFFER_SIZE];
+
 volatile uint8_t wav_transfer_complete = 0;
 volatile uint8_t wav_half_transfer = 0;
 uint8_t is_playing = 0;
+uint8_t wav_loop_mode = 0;
 
 // Callback from HAL_SAI_TxCpltCallback
 void Wav_TransferComplete_Callback(void) {
@@ -27,87 +38,170 @@ void Wav_HalfTransfer_Callback(void) {
 static uint8_t Wav_ParseHeader(const char* fname) {
     uint32_t br;
     uint8_t res;
-    uint8_t header_buf[512];
-    ChunkRIFF *riff;
-    ChunkFMT *fmt;
-    ChunkDATA *data;
-    uint32_t offset = 0;
-
+    uint32_t chunk_id, chunk_size;
+    uint32_t file_offset = 12; // Start after RIFF header
+    uint32_t file_size = 0;
+    
+    // Header Buffers
+    ChunkRIFF riff;
+    ChunkFMT fmt;
+    
     res = f_open(&wav_file, fname, FA_READ);
     if (res != FR_OK) return 1;
 
-    f_read(&wav_file, header_buf, 512, (UINT*)&br);
+    // 1. Read RIFF Header
+    f_read(&wav_file, &riff, sizeof(ChunkRIFF), (UINT*)&br);
     if (br < sizeof(ChunkRIFF)) {
         f_close(&wav_file);
         return 2;
     }
 
-    riff = (ChunkRIFF *)header_buf;
-    if (riff->ChunkID != 0X46464952 || riff->Format != 0X45564157) { // "RIFF", "WAVE"
+    if (riff.ChunkID != 0X46464952 || riff.Format != 0X45564157) { // "RIFF", "WAVE"
         f_close(&wav_file);
         return 3;
     }
+    file_size = riff.ChunkSize + 8; // Total file size
 
-    offset = 12;
-    // Simple parser: assumes fmt chunk is first, then maybe fact/LIST, then data
-    // A robust parser would loop through chunks. 
-    // For simplicity, we check typical offset for "fmt "
-    fmt = (ChunkFMT *)(header_buf + offset);
-    if (fmt->ChunkID != 0X20746D66) { // "fmt "
-        // Try to search for fmt chunk? Or just fail for now.
-        // Let's implement a simple search within first 512 bytes
-        uint32_t search_ptr = 12;
-        int found = 0;
-        while(search_ptr < 400) {
-             if (*(uint32_t*)(header_buf + search_ptr) == 0X20746D66) {
-                 fmt = (ChunkFMT *)(header_buf + search_ptr);
-                 found = 1;
-                 break;
-             }
-             search_ptr++;
-        }
-        if (!found) {
-            f_close(&wav_file);
-            return 4;
-        }
-    }
-    
-    offset = (uint32_t)((uint8_t*)fmt - header_buf) + 8 + fmt->ChunkSize;
-    
-    // Search for "data" chunk
-    uint32_t search_ptr = offset;
+    // 2. Iterate through Chunks
+    int found_fmt = 0;
     int found_data = 0;
-    // We scan forward for "data" (0x61746164)
-    while(search_ptr < 500) {
-        if (*(uint32_t*)(header_buf + search_ptr) == 0X61746164) {
-            data = (ChunkDATA *)(header_buf + search_ptr);
+
+    while (file_offset < file_size) {
+        // Read Chunk Header (8 bytes)
+        res = f_lseek(&wav_file, file_offset);
+        if (res != FR_OK) break;
+        
+        f_read(&wav_file, &chunk_id, 4, (UINT*)&br);
+        if (br < 4) break;
+        f_read(&wav_file, &chunk_size, 4, (UINT*)&br);
+        if (br < 4) break;
+
+        // Process Chunk
+        if (chunk_id == 0X20746D66) { // "fmt "
+            f_read(&wav_file, (void*)&fmt.AudioFormat, sizeof(ChunkFMT) - 8, (UINT*)&br); // Read content of fmt starting from AudioFormat
+            
+            wavctrl.audioformat = fmt.AudioFormat;
+            wavctrl.nchannels = fmt.NumOfChannels;
+            wavctrl.samplerate = fmt.SampleRate;
+            wavctrl.bitrate = fmt.ByteRate * 8;
+            wavctrl.blockalign = fmt.BlockAlign;
+            wavctrl.bps = fmt.BitsPerSample;
+            found_fmt = 1;
+        } 
+        else if (chunk_id == 0X61746164) { // "data"
+            wavctrl.datasize = chunk_size;
+            wavctrl.datastart = file_offset + 8; // Data starts after header
             found_data = 1;
-            break;
+            break; // Stop after finding data (assuming fmt is before data)
         }
-        search_ptr++;
+        
+        // Move to next chunk
+        file_offset += 8 + chunk_size;
+        
+        // Handle padding byte if chunk size is odd
+        if (chunk_size % 2 != 0) file_offset++;
+    }
+
+    if (!found_fmt) {
+        f_close(&wav_file);
+        return 4; // fmt chunk not found
     }
 
     if (!found_data) {
-        // Data chunk might be beyond 512 bytes? unlikely for standard wavs
         f_close(&wav_file);
-        return 5;
+        return 5; // data chunk not found
     }
-
-    wavctrl.audioformat = fmt->AudioFormat;
-    wavctrl.nchannels = fmt->NumOfChannels;
-    wavctrl.samplerate = fmt->SampleRate;
-    wavctrl.bitrate = fmt->ByteRate * 8;
-    wavctrl.blockalign = fmt->BlockAlign;
-    wavctrl.bps = fmt->BitsPerSample;
-    wavctrl.datasize = data->ChunkSize;
-    wavctrl.datastart = search_ptr + 8; // data chunk header + size (8 bytes)
+    
+    // Support non-PCM format (e.g. 0xFFFE extensible) if simple PCM is valid
+    if (wavctrl.audioformat != 1 && wavctrl.audioformat != 0xFFFE) {
+         USB_Print("[WAV] Warning: Non-PCM format %d\r\n", wavctrl.audioformat);
+         // Don't fail here, try to play anyway as some WAVs are tricky
+    }
 
     return 0;
 }
 
+// Helper to expand Mono 16-bit to Stereo 16-bit
+// dst_buf size must be 2x src_buf size
+static void ExpandMonoToStereo16(uint8_t *dst, uint8_t *src, uint32_t src_bytes) {
+    int16_t *s = (int16_t*)src;
+    int16_t *d = (int16_t*)dst;
+    uint32_t samples = src_bytes / 2;
+    
+    for(uint32_t i=0; i<samples; i++) {
+        d[i*2]     = s[i]; // Left
+        d[i*2 + 1] = s[i]; // Right
+    }
+}
+
+static void FillBuffer(uint8_t *buffer, uint32_t buffer_size) {
+    UINT br;
+    FRESULT res;
+    
+    if (wavctrl.nchannels == 1 && wavctrl.bps == 16) {
+        // Mono 16-bit -> Read half amount, expand to stereo
+        res = f_read(&wav_file, wav_read_buffer, buffer_size / 2, &br);
+        if (res != FR_OK || br == 0) {
+             if (wav_loop_mode && br == 0) {
+                 f_lseek(&wav_file, wavctrl.datastart);
+                 f_read(&wav_file, wav_read_buffer, buffer_size / 2, &br);
+             }
+             if (br == 0) {
+                 memset(buffer, 0, buffer_size);
+                 Wav_Stop();
+                 return;
+             }
+        }
+        ExpandMonoToStereo16(buffer, wav_read_buffer, br);
+        // If read less than expected (EOF), zero pad the rest
+        if (br < buffer_size / 2) {
+             if (wav_loop_mode) {
+                 f_lseek(&wav_file, wavctrl.datastart);
+                 // Fill the rest
+                 UINT br2;
+                 f_read(&wav_file, wav_read_buffer, (buffer_size / 2) - br, &br2);
+                 ExpandMonoToStereo16(buffer + br*2, wav_read_buffer, br2);
+                 if (br + br2 < buffer_size / 2) {
+                     memset(buffer + (br+br2)*2, 0, buffer_size - (br+br2)*2);
+                 }
+             } else {
+                 memset(buffer + br*2, 0, buffer_size - br*2);
+                 Wav_Stop();
+             }
+        }
+    } else {
+        // Already Stereo or other format -> Read directly
+        res = f_read(&wav_file, buffer, buffer_size, &br);
+        if (res != FR_OK || br == 0) {
+             if (wav_loop_mode && br == 0) {
+                 f_lseek(&wav_file, wavctrl.datastart);
+                 f_read(&wav_file, buffer, buffer_size, &br);
+             }
+             if (br == 0) {
+                 memset(buffer, 0, buffer_size);
+                 Wav_Stop();
+                 return;
+             }
+        }
+        if (br < buffer_size) {
+             if (wav_loop_mode) {
+                 f_lseek(&wav_file, wavctrl.datastart);
+                 UINT br2;
+                 f_read(&wav_file, buffer + br, buffer_size - br, &br2);
+                 if (br + br2 < buffer_size) {
+                     memset(buffer + br + br2, 0, buffer_size - (br + br2));
+                 }
+             } else {
+                 memset(buffer + br, 0, buffer_size - br);
+                 Wav_Stop();
+             }
+        }
+    }
+}
+
 uint8_t Wav_Play(const char* fname) {
     uint8_t res;
-    uint32_t br;
+    // uint32_t br;
 
     USB_Print("[WAV] Parsing %s...\r\n", fname);
     res = Wav_ParseHeader(fname);
@@ -119,11 +213,6 @@ uint8_t Wav_Play(const char* fname) {
     USB_Print("[WAV] Info: %d Hz, %d Bit, %d Ch\r\n", wavctrl.samplerate, wavctrl.bps, wavctrl.nchannels);
     USB_Print("[WAV] Data Start: %u, Data Size: %u\r\n", wavctrl.datastart, wavctrl.datasize);
 
-    // Configure WM8978 and SAI based on WAV format
-    // WM8978 supports 16/20/24/32 bits. 
-    // STM32 SAI DataSize should match.
-    // For simplicity, we assume 16-bit or 24-bit.
-    
     uint8_t word_len = 0;
     if (wavctrl.bps == 16) word_len = 0;      // 16-bit
     else if (wavctrl.bps == 24) word_len = 2; // 24-bit
@@ -140,18 +229,19 @@ uint8_t Wav_Play(const char* fname) {
     // Reconfigure WM8978 I2S Format
     WM8978_I2S_Cfg(2, word_len); // I2S Standard
 
-    // Reconfigure SAI (Sample Rate & Bit Depth) - Using HAL handle directly
-    // Note: To change HAL SAI config properly, we should deinit and reinit.
-    // But for now, let's try just disabling SAI, updating init struct, and Init.
+    // Reconfigure SAI
     HAL_SAI_DeInit(&hsai_BlockA1);
     
+    // Always use Stereo Mode for hardware consistency
     hsai_BlockA1.Init.AudioFrequency = 6000;//wavctrl.samplerate;
+    hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE; 
+
     if (wavctrl.bps == 16) {
         hsai_BlockA1.Init.DataSize = SAI_DATASIZE_16;
     } else if (wavctrl.bps == 24) {
-        hsai_BlockA1.Init.DataSize = SAI_DATASIZE_24; // Or 32 if padded
+        hsai_BlockA1.Init.DataSize = SAI_DATASIZE_24; 
     } else {
-        hsai_BlockA1.Init.DataSize = SAI_DATASIZE_16; // Fallback
+        hsai_BlockA1.Init.DataSize = SAI_DATASIZE_16; 
     }
     
     if (HAL_SAI_Init(&hsai_BlockA1) != HAL_OK) {
@@ -161,17 +251,21 @@ uint8_t Wav_Play(const char* fname) {
     }
 
     // Prepare DMA Buffer
-    // Seek to data start
     f_lseek(&wav_file, wavctrl.datastart);
     
-    // Fill first half and second half
-    f_read(&wav_file, wav_dma_buffer, WAV_DMA_BUFFER_SIZE, (UINT*)&br);
+    // Initial Fill
+    // First Half
+    FillBuffer(&wav_dma_buffer[0], WAV_DMA_BUFFER_SIZE/2);
+    // Second Half
+    FillBuffer(&wav_dma_buffer[WAV_DMA_BUFFER_SIZE/2], WAV_DMA_BUFFER_SIZE/2);
     
     // Start DMA
     is_playing = 1;
     wav_transfer_complete = 0;
     wav_half_transfer = 0;
     
+    // For DMA, we always send stereo data now (expanded if needed)
+    // So the size is always consistent with stereo 16/24/32 bit
     if (HAL_SAI_Transmit_DMA(&hsai_BlockA1, wav_dma_buffer, WAV_DMA_BUFFER_SIZE / (wavctrl.bps/8)) != HAL_OK) {
         USB_Print("[WAV] DMA Start Failed!\r\n");
         f_close(&wav_file);
@@ -183,62 +277,28 @@ uint8_t Wav_Play(const char* fname) {
 }
 
 void Wav_Stop(void) {
-    HAL_SAI_DMAStop(&hsai_BlockA1);
-    f_close(&wav_file);
-    is_playing = 0;
-    USB_Print("[WAV] Stopped.\r\n");
+    if (is_playing) {
+        HAL_SAI_DMAStop(&hsai_BlockA1);
+        f_close(&wav_file);
+        is_playing = 0;
+        USB_Print("[WAV] Stopped.\r\n");
+    }
 }
 
 // Call this in main loop to handle buffer refilling
 void Wav_Process(void) {
     if (!is_playing) return;
 	  
-
-    uint32_t br;
-	  FRESULT res;
-    
     // Handle Half Transfer (Refill First Half)
     if (wav_half_transfer) {
         wav_half_transfer = 0;
-        
-        uint32_t start_ms = HAL_GetTick();
-        res = f_read(&wav_file, &wav_dma_buffer[0], WAV_DMA_BUFFER_SIZE/2, (UINT*)&br);
-        uint32_t end_ms = HAL_GetTick();
-        
-        // Calculate speed every 20 chunks (~1s) to avoid spamming
-        static int count = 0;
-        if (++count % 20 == 0) {
-             float speed = (float)br / (end_ms - start_ms); // KB/s
-             USB_Print("[PERF] Read %d bytes in %lu ms (%.1f KB/s)\r\n", br, end_ms - start_ms, speed);
-        }
-
-        if (res != FR_OK) {
-             USB_Print("[WAV] Read Err 1: %d\r\n", res);
-        }
-        if (br < WAV_DMA_BUFFER_SIZE/2) {
-            USB_Print("[WAV] EOF/Short Read 1: %d\r\n", br);
-            // End of file (or close to it)
-            // For loop playback, seek to start
-            f_lseek(&wav_file, wavctrl.datastart);
-            // Fill the rest with 0 or read from start?
-            // Simple approach: just read from start to fill buffer
-            f_read(&wav_file, &wav_dma_buffer[br], (WAV_DMA_BUFFER_SIZE/2) - br, (UINT*)&br);
-        }
+        FillBuffer(&wav_dma_buffer[0], WAV_DMA_BUFFER_SIZE/2);
     }
 
     // Handle Full Transfer (Refill Second Half)
     if (wav_transfer_complete) {
         wav_transfer_complete = 0;
-        res = f_read(&wav_file, &wav_dma_buffer[WAV_DMA_BUFFER_SIZE/2], WAV_DMA_BUFFER_SIZE/2, (UINT*)&br);
-        if (res != FR_OK) {
-             USB_Print("[WAV] Read Err 2: %d\r\n", res);
-        }
-        if (br < WAV_DMA_BUFFER_SIZE/2) {
-            USB_Print("[WAV] EOF/Short Read 2: %d\r\n", br);
-            // End of file
-            f_lseek(&wav_file, wavctrl.datastart);
-            f_read(&wav_file, &wav_dma_buffer[(WAV_DMA_BUFFER_SIZE/2) + br], (WAV_DMA_BUFFER_SIZE/2) - br, (UINT*)&br);
-        }
+        FillBuffer(&wav_dma_buffer[WAV_DMA_BUFFER_SIZE/2], WAV_DMA_BUFFER_SIZE/2);
     }
 }
 

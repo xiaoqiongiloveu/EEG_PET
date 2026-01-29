@@ -66,8 +66,13 @@ typedef struct
     uint32_t datastart;     // Data Start Offset
 } __wavctrl; 
 
+// Global Variables
+extern uint8_t wav_loop_mode;
+extern uint8_t is_playing;
+
 // Functions
 uint8_t Wav_Play(const char* fname);
 void Wav_Stop(void);
+void Wav_Process(void);
 
 #endif

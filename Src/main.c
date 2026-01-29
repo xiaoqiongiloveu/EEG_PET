@@ -34,6 +34,7 @@
 #include <string.h>
 #include "command_system.h"
 #include "commands_impl.h"
+#include "ad5933.h"
 #include "wm8978.h"
 #include "wavplay.h"
 /* USER CODE END Includes */
@@ -80,6 +81,7 @@ uint8_t file_opened = 0;   // Flag for file open status
 float Battery_Voltage = 0.0f;
 float acc[3], gyro[3];
 uint32_t last_qmi_print = 0;
+uint8_t wm8978_initialized = 0;
 
 /* USER CODE END PV */
 
@@ -117,28 +119,28 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 void SD_Init_Process(void)
 {
     // 1. Mount File System
-    USB_Print("[SD] Mounting FS... (ClockDiv: %d)\r\n", hsd1.Init.ClockDiv);
+    // USB_Print("[SD] Mounting FS... (ClockDiv: %d)\r\n", hsd1.Init.ClockDiv);
     // Retry mount up to 3 times
     for(int i=0; i<3; i++) {
         res = f_mount(&SDFatFS, SDPath, 1);
         if(res == FR_OK) break;
-        USB_Print("[SD] Mount attempt %d failed: %d. Retrying...\r\n", i+1, res);
+        // USB_Print("[SD] Mount attempt %d failed: %d. Retrying...\r\n", i+1, res);
         HAL_Delay(100);
     }
     
     if(res != FR_OK)
     {
-        USB_Print("[SD] Mount Failed! Error: %d\r\n", res);
+        // USB_Print("[SD] Mount Failed! Error: %d\r\n", res);
         return;
     }
-    USB_Print("[SD] Mount Success!\r\n");
+    // USB_Print("[SD] Mount Success!\r\n");
     sd_mounted = 1;
 
     // 2. Test Write
-    USB_Print("[SD] Testing Write to '2025.txt'...\r\n");
+    // USB_Print("[SD] Testing Write to '2025.txt'...\r\n");
     res = f_open(&SDFile, "2025.txt", FA_CREATE_ALWAYS | FA_WRITE);
     if(res != FR_OK) {
-        USB_Print("[SD] Open for Write Failed! Error: %d\r\n", res);
+        // USB_Print("[SD] Open for Write Failed! Error: %d\r\n", res);
         return;
     }
     
@@ -146,25 +148,25 @@ void SD_Init_Process(void)
     UINT bytes_written;
     res = f_write(&SDFile, test_str, strlen(test_str), &bytes_written);
     if(res != FR_OK) {
-        USB_Print("[SD] Write Failed! Error: %d\r\n", res);
+        // USB_Print("[SD] Write Failed! Error: %d\r\n", res);
         f_close(&SDFile);
         return;
     }
-    USB_Print("[SD] Written %d bytes.\r\n", bytes_written);
+    // USB_Print("[SD] Written %d bytes.\r\n", bytes_written);
     
     // Explicitly sync the file buffer to physical disk
     res = f_sync(&SDFile);
     if(res != FR_OK) {
-        USB_Print("[SD] Sync Failed! Error: %d\r\n", res);
+        // USB_Print("[SD] Sync Failed! Error: %d\r\n", res);
     }
 
     f_close(&SDFile);
 
     // 3. Test Read
-    USB_Print("[SD] Testing Read from '2025.txt'...\r\n");
+    // USB_Print("[SD] Testing Read from '2025.txt'...\r\n");
     res = f_open(&SDFile, "2025.txt", FA_READ);
     if(res != FR_OK) {
-        USB_Print("[SD] Open for Read Failed! Error: %d\r\n", res);
+        // USB_Print("[SD] Open for Read Failed! Error: %d\r\n", res);
         return;
     }
     
@@ -172,18 +174,93 @@ void SD_Init_Process(void)
     UINT bytes_read;
     res = f_read(&SDFile, read_buf, sizeof(read_buf)-1, &bytes_read);
     if(res != FR_OK) {
-        USB_Print("[SD] Read Failed! Error: %d\r\n", res);
+        // USB_Print("[SD] Read Failed! Error: %d\r\n", res);
         f_close(&SDFile);
         return;
     }
-    USB_Print("[SD] Read Content: %s\r\n", read_buf);
+    // USB_Print("[SD] Read Content: %s\r\n", read_buf);
     f_close(&SDFile);
     
-    USB_Print("[SD] Test Complete.\r\n");
+    // USB_Print("[SD] Test Complete.\r\n");
     
     // Prepare data.bin for logging (optional, if we were logging)
     // res = f_open(&SDFile, "data.bin", FA_OPEN_APPEND | FA_WRITE);
     // if(res == FR_OK) file_opened = 1;
+}
+
+void User_BSP_Init(void)
+{
+    // 1. Power Control (Must be first)
+    Power_Control_Init();
+    
+    // 2. Soft I2C for Sensors
+    Soft_I2C_Init();
+}
+
+void User_Device_Init(void)
+{
+    // 1. Initialize Circular Buffer (Required for ADS1299)
+    circular_buffer_init(&ADS1299_circula_buffer, CIRCULAR_BUFFER_MAX_SIZE);
+
+    // 2. ADS1299 EEG AFE Init
+    ADS1299_Init();
+    
+    // 3. QMI8658 IMU Init
+    // USB_Print("[BOOT] Initializing QMI8658...\r\n");
+    if (QMI8658_Init() == 0) {
+        // USB_Print("[BOOT] QMI8658 Init Success (ID=0x05)\r\n");
+    } else {
+        // USB_Print("[BOOT] QMI8658 Init Failed!\r\n");
+    }
+    
+    // 4. SD Card Init
+    // USB_Print("[BOOT] Initializing SD Card...\r\n");
+    SD_Init_Process(); 
+
+    // 5. AD5933 Impedance Converter Scan & Init
+    // USB_Print("[I2C] Scanning I2C1 bus...\r\n");
+    uint8_t ad5933_found = 0;
+    for(uint16_t addr = 0; addr < 128; addr++) {
+        if(HAL_I2C_IsDeviceReady(&hi2c1, (addr << 1), 1, 10) == HAL_OK) {
+            // USB_Print("[I2C] Found device at 0x%02X\r\n", addr);
+            if (addr == 0x0D) ad5933_found = 1;
+        }
+    }
+
+    if (ad5933_found) {
+        // USB_Print("[BOOT] AD5933 Found! Initializing...\r\n");
+        AD5933_Init();
+    } else {
+        // USB_Print("[BOOT] AD5933 NOT Found (Check connections to PB6/PB7)\r\n");
+    }
+
+    // 6. WM8978 Audio Codec Init
+    if (WM8978_Init() == 0) {
+        wm8978_initialized = 1;
+        // USB_Print("[BOOT] WM8978 Init Success!\r\n");
+        
+        // Basic Config for DAC output (Headphones)
+        WM8978_ADDA_Cfg(1, 0);      // Enable DAC, Disable ADC
+        WM8978_Write_Reg(11, 0xFF); // Digital Volume Max
+        
+        // Enable Speaker Boost (Optional)
+        uint16_t r49 = WM8978_Read_Reg(49);
+        WM8978_Write_Reg(49, r49 | (1 << 2)); // Bit 2 is SPKBOOST
+
+        WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
+        WM8978_Output_Cfg(1, 0);    // Enable DAC Output
+        WM8978_HPvol_Set(63, 63);   // Headphone Volume (Max 63)
+        WM8978_SPKvol_Set(63);      // Speaker Volume (Max 63)
+    } else {
+        wm8978_initialized = 0;
+        // USB_Print("[BOOT] WM8978 Init Failed!\r\n");
+    }
+}
+
+void User_App_Init(void)
+{
+    // Register CLI Commands
+    register_all_commands();
 }
 /* USER CODE END 0 */
 
@@ -228,106 +305,27 @@ int main(void)
   MX_FATFS_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-  Power_Control_Init();
+  // 1. BSP Init (Power, Soft I2C)
+  User_BSP_Init();
 
-  Soft_I2C_Init();
-  circular_buffer_init(&ADS1299_circula_buffer, CIRCULAR_BUFFER_MAX_SIZE);
-  ADS1299_Init();
+  // 2. Device Init (ADS1299, QMI8658, AD5933)
+  User_Device_Init();
+
+  /* 
+   * Note: ADS1299 Auto-start and WM8978 test code were removed 
+   * during refactoring to keep main() clean.
+   * See User_Device_Init() for sensor details.
+   */
+
+  // 3. App Init (CLI, Buffers)
+  User_App_Init();
   
-  USB_Print("[BOOT] Initializing QMI8658...\r\n");
-  if (QMI8658_Init() == 0) {
-      USB_Print("[BOOT] QMI8658 Init Success (ID=0x05)\r\n");
-  } else {
-      USB_Print("[BOOT] QMI8658 Init Failed!\r\n");
+  // Play 1.wav after init
+  Wav_Play("AUDIO/1.wav");
+  while(is_playing) {
+      Wav_Process();
   }
-
-  /* Auto-start ADS1299 (Simulate QUAD command for 8 channels) */
-//  USB_Print("[BOOT] Starting ADS1299 Acquisition (8 Channels)...\r\n");
-//  ADS1299_Stop();
-//  ADS1299_Set_Sample_Parameter(6, 6, 0); // 250SPS, Gain 24, Normal Input
-//  
-//  // Enable all 8 channels
-//  for(int i=1; i<=8; i++) {
-//      ADS1299_Write_Reg(0x04 + i, 0x60); // Gain 24, Normal Input
-//  }
-//  
-//  USB_Print("\r\n[BOOT] ADS1299 Registers before START:\r\n");
-//  uint8_t regs[24];
-//  ADS1299_Read_Regs(0x00, regs, 24);
-//  for(int i=0; i<24; i++) {
-//      USB_Print("Reg[0x%02X] = 0x%02X\r\n", i, regs[i]);
-//      HAL_Delay(5);
-//  }
-
-//  ADS1299_Start();
-//  circular_buffer_clear(&ADS1299_circula_buffer);
-
-  USB_Print("[BOOT] Initializing SD Card...\r\n");
-  SD_Init_Process(); 
-
-  USB_Print("[BOOT] Initializing WM8978...\r\n");
   
-  // Enable SAI MCLK output by starting transmission of dummy data
-  // WM8978 often needs MCLK to operate its internal digital logic (including I2C sometimes)
-  // Generate a simple square wave / beep for testing
-  // 48kHz sample rate, 16-bit stereo
-  static int16_t test_audio_buffer[100]; // 50 samples stereo
-  for(int i=0; i<100; i+=2) {
-      // Simple square wave
-      if (i < 50) {
-          test_audio_buffer[i] = 8000;   // Left
-          test_audio_buffer[i+1] = 8000; // Right
-      } else {
-          test_audio_buffer[i] = -8000;
-          test_audio_buffer[i+1] = -8000;
-      }
-  }
-
-  // Use DMA Circular mode so it plays continuously without while(1) intervention
-  if (HAL_SAI_Transmit_DMA(&hsai_BlockA1, (uint8_t*)test_audio_buffer, 100) != HAL_OK) {
-      USB_Print("[BOOT] SAI Transmit Start Failed!\r\n");
-  } else {
-      USB_Print("[BOOT] SAI MCLK Started. Playing test tone...\r\n");
-  }
-  HAL_Delay(10); // Wait for clock to stabilize
-
-  // I2C Scan
-  USB_Print("[I2C] Scanning I2C1 bus...\r\n");
-  for(uint16_t addr = 0; addr < 128; addr++) {
-      if(HAL_I2C_IsDeviceReady(&hi2c1, (addr << 1), 1, 10) == HAL_OK) {
-          USB_Print("[I2C] Found device at 0x%02X\r\n", addr);
-      }
-  }
-
-  if (WM8978_Init() == 0) {
-      USB_Print("[BOOT] WM8978 Init Success!\r\n");
-      WM8978_ADDA_Cfg(1, 0);      // Enable DAC, Disable ADC
-      // Force DAC Digital Volume to Max (+12dB)
-      // R11: DAC Control. 0xFF = +12dB (0dB is 0xC0)
-      WM8978_Write_Reg(11, 0xFF); 
-      
-      // Enable Speaker Boost (Optional, increases gain by 1.5x on some configs)
-      // R49: Output Control. TSDEN=1, SPKBOOST=1
-      uint16_t r49 = WM8978_Read_Reg(49);
-      WM8978_Write_Reg(49, r49 | (1 << 2)); // Bit 2 is SPKBOOST
-
-      WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
-      WM8978_Output_Cfg(1, 0);    // Enable DAC Output
-      WM8978_HPvol_Set(63, 63);   // Headphone Volume (Max 63)
-      WM8978_SPKvol_Set(63);      // Speaker Volume (Max 63)
-      // I2S Config will be handled by Wav_Play
-      
-      // Start Playing Music
-      if (Wav_Play("music.wav") == 0) {
-          USB_Print("[BOOT] Music playback started!\r\n");
-      } else {
-          USB_Print("[BOOT] Music playback failed to start.\r\n");
-      }
-  } else {
-      USB_Print("[BOOT] WM8978 Init Failed!\r\n");
-  }
-
-  register_all_commands();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -345,7 +343,6 @@ int main(void)
     app_run_loop();
     
     // Process WAV double buffer filling
-    extern void Wav_Process(void);
     Wav_Process();
     
 //    
@@ -827,6 +824,13 @@ void Check_Power_Off(void) {
             while (HAL_GPIO_ReadPin(POWER_KEY_GPIO_Port, POWER_KEY_Pin) == GPIO_PIN_RESET) {
                 if (HAL_GetTick() - press_start >= 2000) {
                     // Confirm press for 2 seconds -> Power OFF
+                    
+                    // Play 2.wav before power off
+                    Wav_Play("AUDIO/2.wav");
+                    while(is_playing) {
+                        Wav_Process();
+                    }
+                    
                     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
                     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET); // Unlatch Power (PA4 Low)
                     while(1); // Wait for power cut

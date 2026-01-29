@@ -508,6 +508,21 @@
               <FileType>1</FileType>
               <FilePath>..\Src\commands_impl.c</FilePath>
             </File>
+            <File>
+              <FileName>wm8978.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\wm8978.c</FilePath>
+            </File>
+            <File>
+              <FileName>wavplay.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\wavplay.c</FilePath>
+            </File>
+            <File>
+              <FileName>ad5933.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\ad5933.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
