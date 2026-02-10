@@ -1,9 +1,163 @@
 #include "ad5933.h"
+#include "main.h"
+#include "delay.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h> // For abs
 
-extern I2C_HandleTypeDef hi2c1;
+/* Pin Definitions - PB10/PB11 for AD5933 (Swapped) */
+#define AD5933_SCL_PIN GPIO_PIN_10
+#define AD5933_SCL_PORT GPIOB
+#define AD5933_SDA_PIN GPIO_PIN_11
+#define AD5933_SDA_PORT GPIOB
+
+/* Macros for GPIO Control */
+#define SCL_H() HAL_GPIO_WritePin(AD5933_SCL_PORT, AD5933_SCL_PIN, GPIO_PIN_SET)
+#define SCL_L() HAL_GPIO_WritePin(AD5933_SCL_PORT, AD5933_SCL_PIN, GPIO_PIN_RESET)
+
+#define SDA_H() HAL_GPIO_WritePin(AD5933_SDA_PORT, AD5933_SDA_PIN, GPIO_PIN_SET)
+#define SDA_L() HAL_GPIO_WritePin(AD5933_SDA_PORT, AD5933_SDA_PIN, GPIO_PIN_RESET)
+
+#define SDA_READ() HAL_GPIO_ReadPin(AD5933_SDA_PORT, AD5933_SDA_PIN)
+
+/* Delay Function for I2C Timing */
+static void I2C_Delay(void) {
+    delay_us(5); 
+}
+
+/**
+  * @brief  Initialize Soft I2C for AD5933
+  */
+void AD5933_Soft_I2C_Init(void) {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Configure GPIOs */
+    GPIO_InitStruct.Pin = AD5933_SCL_PIN | AD5933_SDA_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* Idle State */
+    SCL_H();
+    SDA_H();
+}
+
+/**
+  * @brief  Generate I2C Start Condition
+  */
+void AD5933_Soft_I2C_Start(void) {
+    SDA_H();
+    SCL_H();
+    I2C_Delay();
+    SDA_L();
+    I2C_Delay();
+    SCL_L(); // Hold SCL Low
+    I2C_Delay();
+}
+
+/**
+  * @brief  Generate I2C Stop Condition
+  */
+void AD5933_Soft_I2C_Stop(void) {
+    SDA_L();
+    I2C_Delay();
+    SCL_H();
+    I2C_Delay();
+    SDA_H();
+    I2C_Delay();
+}
+
+/**
+  * @brief  Wait for ACK from Slave
+  * @retval 0: ACK received, 1: NACK (No ACK)
+  */
+uint8_t AD5933_Soft_I2C_WaitAck(void) {
+    uint8_t ack = 0;
+    uint16_t timeout = 0;
+    
+    SDA_H(); // Release SDA line
+    I2C_Delay();
+    SCL_H(); // Clock High
+    I2C_Delay();
+    
+    while (SDA_READ()) {
+        timeout++;
+        if (timeout > 250) {
+            AD5933_Soft_I2C_Stop();
+            return 1; // NACK/Timeout
+        }
+    }
+    
+    SCL_L(); // Clock Low
+    I2C_Delay();
+    return 0; // ACK received
+}
+
+/**
+  * @brief  Send ACK/NACK to Slave
+  * @param  ack: 0 for ACK, 1 for NACK
+  */
+void AD5933_Soft_I2C_SendAck(uint8_t ack) {
+    if (ack) {
+        SDA_H(); // NACK (High)
+    } else {
+        SDA_L(); // ACK (Low)
+    }
+    I2C_Delay();
+    SCL_H();
+    I2C_Delay();
+    SCL_L();
+    I2C_Delay();
+    SDA_H(); // Release SDA
+}
+
+/**
+  * @brief  Send one byte to I2C Bus
+  * @param  data: Byte to send
+  */
+void AD5933_Soft_I2C_SendByte(uint8_t data) {
+    for (uint8_t i = 0; i < 8; i++) {
+        if (data & 0x80) {
+            SDA_H();
+        } else {
+            SDA_L();
+        }
+        data <<= 1;
+        I2C_Delay();
+        SCL_H();
+        I2C_Delay();
+        SCL_L();
+        I2C_Delay();
+    }
+}
+
+/**
+  * @brief  Read one byte from I2C Bus with ACK/NACK
+  * @param  ack: 0 to send ACK, 1 to send NACK (usually for last byte)
+  * @retval Received byte
+  */
+uint8_t AD5933_Soft_I2C_ReadByte(uint8_t ack) {
+    uint8_t data = 0;
+    SDA_H(); // Ensure SDA is released
+    
+    for (uint8_t i = 0; i < 8; i++) {
+        data <<= 1;
+        SCL_H();
+        I2C_Delay();
+        if (SDA_READ()) {
+            data |= 0x01;
+        }
+        SCL_L();
+        I2C_Delay();
+    }
+    
+    AD5933_Soft_I2C_SendAck(ack);
+    return data;
+}
+
 extern void USB_Print(const char* format, ...);
 
 // Constants from reference
@@ -26,15 +180,26 @@ double SystemPhase[] = {108.647, 109.279, 109.847, 110.485, 111.151, 111.763, 11
   */
 void AD5933_WriteReg(uint8_t reg, uint8_t val)
 {
-    uint8_t data[2];
-    data[0] = reg;
-    data[1] = val;
+    AD5933_Soft_I2C_Start();
+    AD5933_Soft_I2C_SendByte(AD5933_ADDR_8BIT); // Write Addr
+    if (AD5933_Soft_I2C_WaitAck()) {
+        AD5933_Soft_I2C_Stop();
+        return; // Error
+    }
     
-    // Send [REG] [VAL]
-    // Note: The reference code for i2c_write(reg, val) sends:
-    // START -> ADDR -> REG -> VAL -> STOP
-    // This is a standard I2C write of 2 bytes to the device address.
-    HAL_I2C_Master_Transmit(&hi2c1, AD5933_ADDR_8BIT, data, 2, 100);
+    AD5933_Soft_I2C_SendByte(reg);
+    if (AD5933_Soft_I2C_WaitAck()) {
+        AD5933_Soft_I2C_Stop();
+        return;
+    }
+    
+    AD5933_Soft_I2C_SendByte(val);
+    if (AD5933_Soft_I2C_WaitAck()) {
+        AD5933_Soft_I2C_Stop();
+        return;
+    }
+    
+    AD5933_Soft_I2C_Stop();
 }
 
 /**
@@ -47,13 +212,18 @@ uint8_t AD5933_ReadReg(uint8_t reg)
     uint8_t val = 0;
     
     // 1. Set Address Pointer
-    // Reference: i2c_write(POINTER_COMMAND, register_address);
-    // Sends: ADDR -> 0xB0 -> REG_ADDR
     AD5933_WriteReg(POINTER_COMMAND, reg);
     
     // 2. Read Byte
-    // Reference: i2c_read() -> Sends ADDR|R -> Read Byte -> STOP
-    HAL_I2C_Master_Receive(&hi2c1, AD5933_ADDR_8BIT, &val, 1, 100);
+    AD5933_Soft_I2C_Start();
+    AD5933_Soft_I2C_SendByte(AD5933_ADDR_8BIT | 0x01); // Read Addr
+    if (AD5933_Soft_I2C_WaitAck()) {
+        AD5933_Soft_I2C_Stop();
+        return 0; // Error
+    }
+    
+    val = AD5933_Soft_I2C_ReadByte(1); // NACK for last byte
+    AD5933_Soft_I2C_Stop();
     
     return val;
 }
@@ -63,6 +233,7 @@ uint8_t AD5933_ReadReg(uint8_t reg)
   */
 void AD5933_Init(void)
 {
+    AD5933_Soft_I2C_Init();
     HAL_Delay(100);
 
     // 1. Start Frequency (30kHz)
@@ -105,6 +276,15 @@ void AD5933_Init(void)
     // 0x80 = 0x21
     AD5933_WriteReg(0x80, 0x21);
     
+    // Verify Communication: Read back Start Frequency Register (0x84)
+    // We wrote 0x45 to 0x84 previously.
+    uint8_t check_val = AD5933_ReadReg(0x84);
+    if(check_val == 0x45) {
+        USB_Print("[AD5933] Init Success! Reg[0x84] Readback: 0x%02X (Match)\r\n", check_val);
+    } else {
+        USB_Print("[AD5933] Init Warning: Reg[0x84] Readback: 0x%02X (Expected 0x45). Check Wiring!\r\n", check_val);
+    }
+
     USB_Print("[AD5933] Init Complete. Sweep Started.\r\n");
 }
 

@@ -111,7 +111,9 @@ uint16_t usb_cmd_index = 0;
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
-
+volatile uint8_t g_rx_test_mode = 0;
+volatile uint32_t g_rx_test_count = 0;
+volatile uint8_t g_rx_test_last_byte = 0;
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
@@ -266,18 +268,34 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   
-  static uint8_t is_new_command = 1;
-  
-  if (is_new_command && usb_cmd_index > 0) {
-      usb_cmd_index = 0;
-  }
-  
-  for(uint32_t i = 0; i < *Len; i++) {
-      uint8_t rx_byte = Buf[i];
-      
-      if (rx_byte == '\r') {
-          continue;
-      }
+  if (g_rx_test_mode) {
+        for (uint32_t i = 0; i < *Len; i++) {
+            uint8_t current_byte = Buf[i];
+            if (g_rx_test_last_byte == 0x03 && current_byte == 0x03) {
+                g_rx_test_count++;
+                g_rx_test_last_byte = 0;
+            } else {
+                g_rx_test_last_byte = current_byte;
+            }
+        }
+        // Do not return here, so we can still receive STOP command
+    }
+    
+    static uint8_t is_new_command = 1;
+    
+    if (is_new_command && usb_cmd_index > 0) {
+        usb_cmd_index = 0;
+    }
+    
+    for(uint32_t i = 0; i < *Len; i++) {
+        uint8_t rx_byte = Buf[i];
+
+        // In test mode, ignore 0x03 to prevent buffer overflow
+        if (g_rx_test_mode && rx_byte == 0x03) continue;
+        
+        if (rx_byte == '\r') {
+            continue;
+        }
       
       if (rx_byte != '\n' && usb_cmd_index < sizeof(usb_cmd_buffer)-1) {
           usb_cmd_buffer[usb_cmd_index++] = rx_byte;

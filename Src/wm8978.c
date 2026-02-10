@@ -1,4 +1,5 @@
 #include "wm8978.h"
+#include "main.h"
 
 /* External I2C Handle from main.c */
 extern I2C_HandleTypeDef hi2c1;
@@ -71,14 +72,14 @@ uint8_t WM8978_Init(void)
     // R2: ROUT1EN=1, LOUT1EN=1, BOOSTENR=1, BOOSTENL=1
     WM8978_Write_Reg(2, 0X1B0);
     
-    // R3: LOUT2EN=1, ROUT2EN=1, RMIXEN=1, LMIXEN=1
-    WM8978_Write_Reg(3, 0X6C);
+    // R3: LOUT2EN=0, ROUT2EN=0, RMIXEN=1, LMIXEN=1 (Output to Headphone Only)
+    WM8978_Write_Reg(3, 0X0C);
     
     // R6: MCLK Source (Keep default, typically MCLK input)
     WM8978_Write_Reg(6, 0);
     
-    // R43: INVROUT2=1
-    WM8978_Write_Reg(43, 1 << 4);
+    // R43: INVROUT2=0 (Disable Speaker Inversion)
+    WM8978_Write_Reg(43, 0);
     
     // R47: PGABOOSTL=1 (+20dB Mic Boost)
     WM8978_Write_Reg(47, 1 << 8);

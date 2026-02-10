@@ -119,28 +119,28 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 void SD_Init_Process(void)
 {
     // 1. Mount File System
-    // USB_Print("[SD] Mounting FS... (ClockDiv: %d)\r\n", hsd1.Init.ClockDiv);
+    USB_Print("[SD] Mounting FS... (ClockDiv: %d)\r\n", hsd1.Init.ClockDiv);
     // Retry mount up to 3 times
     for(int i=0; i<3; i++) {
         res = f_mount(&SDFatFS, SDPath, 1);
         if(res == FR_OK) break;
-        // USB_Print("[SD] Mount attempt %d failed: %d. Retrying...\r\n", i+1, res);
+        USB_Print("[SD] Mount attempt %d failed: %d. Retrying...\r\n", i+1, res);
         HAL_Delay(100);
     }
     
     if(res != FR_OK)
     {
-        // USB_Print("[SD] Mount Failed! Error: %d\r\n", res);
+        USB_Print("[SD] Mount Failed! Error: %d\r\n", res);
         return;
     }
-    // USB_Print("[SD] Mount Success!\r\n");
+    USB_Print("[SD] Mount Success!\r\n");
     sd_mounted = 1;
 
     // 2. Test Write
-    // USB_Print("[SD] Testing Write to '2025.txt'...\r\n");
+    USB_Print("[SD] Testing Write to '2025.txt'...\r\n");
     res = f_open(&SDFile, "2025.txt", FA_CREATE_ALWAYS | FA_WRITE);
     if(res != FR_OK) {
-        // USB_Print("[SD] Open for Write Failed! Error: %d\r\n", res);
+        USB_Print("[SD] Open for Write Failed! Error: %d\r\n", res);
         return;
     }
     
@@ -148,25 +148,25 @@ void SD_Init_Process(void)
     UINT bytes_written;
     res = f_write(&SDFile, test_str, strlen(test_str), &bytes_written);
     if(res != FR_OK) {
-        // USB_Print("[SD] Write Failed! Error: %d\r\n", res);
+        USB_Print("[SD] Write Failed! Error: %d\r\n", res);
         f_close(&SDFile);
         return;
     }
-    // USB_Print("[SD] Written %d bytes.\r\n", bytes_written);
+    USB_Print("[SD] Written %d bytes.\r\n", bytes_written);
     
     // Explicitly sync the file buffer to physical disk
     res = f_sync(&SDFile);
     if(res != FR_OK) {
-        // USB_Print("[SD] Sync Failed! Error: %d\r\n", res);
+        USB_Print("[SD] Sync Failed! Error: %d\r\n", res);
     }
 
     f_close(&SDFile);
 
     // 3. Test Read
-    // USB_Print("[SD] Testing Read from '2025.txt'...\r\n");
+    USB_Print("[SD] Testing Read from '2025.txt'...\r\n");
     res = f_open(&SDFile, "2025.txt", FA_READ);
     if(res != FR_OK) {
-        // USB_Print("[SD] Open for Read Failed! Error: %d\r\n", res);
+        USB_Print("[SD] Open for Read Failed! Error: %d\r\n", res);
         return;
     }
     
@@ -174,14 +174,14 @@ void SD_Init_Process(void)
     UINT bytes_read;
     res = f_read(&SDFile, read_buf, sizeof(read_buf)-1, &bytes_read);
     if(res != FR_OK) {
-        // USB_Print("[SD] Read Failed! Error: %d\r\n", res);
+        USB_Print("[SD] Read Failed! Error: %d\r\n", res);
         f_close(&SDFile);
         return;
     }
-    // USB_Print("[SD] Read Content: %s\r\n", read_buf);
+    USB_Print("[SD] Read Content: %s\r\n", read_buf);
     f_close(&SDFile);
     
-    // USB_Print("[SD] Test Complete.\r\n");
+    USB_Print("[SD] Test Complete.\r\n");
     
     // Prepare data.bin for logging (optional, if we were logging)
     // res = f_open(&SDFile, "data.bin", FA_OPEN_APPEND | FA_WRITE);
@@ -203,57 +203,46 @@ void User_Device_Init(void)
     circular_buffer_init(&ADS1299_circula_buffer, CIRCULAR_BUFFER_MAX_SIZE);
 
     // 2. ADS1299 EEG AFE Init
+    USB_Print("[BOOT] Initializing ADS1299...\r\n");
     ADS1299_Init();
     
     // 3. QMI8658 IMU Init
-    // USB_Print("[BOOT] Initializing QMI8658...\r\n");
+    USB_Print("[BOOT] Initializing QMI8658...\r\n");
     if (QMI8658_Init() == 0) {
-        // USB_Print("[BOOT] QMI8658 Init Success (ID=0x05)\r\n");
+        USB_Print("[BOOT] QMI8658 Init Success (ID=0x05)\r\n");
     } else {
-        // USB_Print("[BOOT] QMI8658 Init Failed!\r\n");
+        USB_Print("[BOOT] QMI8658 Init Failed!\r\n");
     }
     
-    // 4. SD Card Init
-    // USB_Print("[BOOT] Initializing SD Card...\r\n");
+    // 4. SD Card Init//
+    USB_Print("[BOOT] Initializing SD Card...\r\n");
     SD_Init_Process(); 
 
     // 5. AD5933 Impedance Converter Scan & Init
-    // USB_Print("[I2C] Scanning I2C1 bus...\r\n");
-    uint8_t ad5933_found = 0;
-    for(uint16_t addr = 0; addr < 128; addr++) {
-        if(HAL_I2C_IsDeviceReady(&hi2c1, (addr << 1), 1, 10) == HAL_OK) {
-            // USB_Print("[I2C] Found device at 0x%02X\r\n", addr);
-            if (addr == 0x0D) ad5933_found = 1;
-        }
-    }
-
-    if (ad5933_found) {
-        // USB_Print("[BOOT] AD5933 Found! Initializing...\r\n");
-        AD5933_Init();
-    } else {
-        // USB_Print("[BOOT] AD5933 NOT Found (Check connections to PB6/PB7)\r\n");
-    }
+    USB_Print("[BOOT] Initializing AD5933 on PB10/PB11 (Soft I2C)...\r\n");
+    AD5933_Init();
 
     // 6. WM8978 Audio Codec Init
+    USB_Print("[BOOT] Initializing WM8978...\r\n");
     if (WM8978_Init() == 0) {
         wm8978_initialized = 1;
-        // USB_Print("[BOOT] WM8978 Init Success!\r\n");
+        USB_Print("[BOOT] WM8978 Init Success!\r\n");
         
         // Basic Config for DAC output (Headphones)
         WM8978_ADDA_Cfg(1, 0);      // Enable DAC, Disable ADC
         WM8978_Write_Reg(11, 0xFF); // Digital Volume Max
         
-        // Enable Speaker Boost (Optional)
-        uint16_t r49 = WM8978_Read_Reg(49);
-        WM8978_Write_Reg(49, r49 | (1 << 2)); // Bit 2 is SPKBOOST
+        // Speaker Boost Removed for Headphone Mode
+        // uint16_t r49 = WM8978_Read_Reg(49);
+        // WM8978_Write_Reg(49, r49 | (1 << 2)); 
 
         WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
         WM8978_Output_Cfg(1, 0);    // Enable DAC Output
         WM8978_HPvol_Set(63, 63);   // Headphone Volume (Max 63)
-        WM8978_SPKvol_Set(63);      // Speaker Volume (Max 63)
+        // WM8978_SPKvol_Set(63);      // Speaker Volume (Disabled)
     } else {
         wm8978_initialized = 0;
-        // USB_Print("[BOOT] WM8978 Init Failed!\r\n");
+        USB_Print("[BOOT] WM8978 Init Failed!\r\n");
     }
 }
 

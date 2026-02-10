@@ -1,4 +1,5 @@
 #include "qmi8658_adapter.h"
+#include "main.h"
 #include "soft_i2c.h"
 #include "delay.h"
 #include "math.h"
@@ -8,7 +9,7 @@ uint8_t g_imu_init = 0;
 qmi8658_state g_imu;
 
 /* Helper for Printing */
-#define printf(...) 
+// #define printf(...) 
 
 /**
  * @brief   Write a byte to QMI8658 register
@@ -155,7 +156,7 @@ static uint8_t QMI8658_Check_WhoAmI(void)
     }
     if((qmi8658_chip_id == 0x05) && (qmi8658_revision_id == 0x7c))
     {
-        printf("QMI8658 Found! Chip ID: %#x, Revision: %#x\r\n", qmi8658_chip_id, qmi8658_revision_id);
+        USB_Print("QMI8658 Found! Chip ID: %#x, Revision: %#x\r\n", qmi8658_chip_id, qmi8658_revision_id);
         return 0;
     }
     else
@@ -238,7 +239,7 @@ static int QMI8658_Send_Ctl9Cmd(enum Ctrl9Command cmd)
     if(ret1 && ret2) return 0;
     else
     {
-        printf("QMI8658_Send_Ctl9Cmd fail cmd=%d\n", cmd);
+        USB_Print("QMI8658_Send_Ctl9Cmd fail cmd=%d\n", cmd);
         return 1;
     }
 }
@@ -568,7 +569,7 @@ uint8_t QMI8658_Init(void)
     {
         return 1;
     }
-    printf("QMI8658 Calibration Success!\r\n");
+    USB_Print("QMI8658 Calibration Success!\r\n");
 
     QMI8658_Write_Byte(Register_Ctrl1, 0x60);   /* I2C Address Auto-Inc */
     QMI8658_Write_Byte(Register_Ctrl7, 0x00);   /* Disable Sensors */

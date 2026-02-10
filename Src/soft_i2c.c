@@ -1,10 +1,10 @@
 #include "soft_i2c.h"
 #include "delay.h"
 
-/* Pin Definitions - Updated to PB10/PB11 as requested */
-#define I2C_SCL_PIN GPIO_PIN_10
+/* Pin Definitions - Updated to PB6/PB7 as requested (Swapped) */
+#define I2C_SCL_PIN GPIO_PIN_6
 #define I2C_SCL_PORT GPIOB
-#define I2C_SDA_PIN GPIO_PIN_11
+#define I2C_SDA_PIN GPIO_PIN_7
 #define I2C_SDA_PORT GPIOB
 
 /* Macros for GPIO Control */
@@ -24,10 +24,21 @@ static void I2C_Delay(void) {
 }
 
 /**
-  * @brief  Initialize Soft I2C (Pins are initialized in main.c MX_GPIO_Init)
+  * @brief  Initialize Soft I2C (Pins are initialized here)
   *         This function ensures bus is in idle state.
   */
 void Soft_I2C_Init(void) {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Configure GPIOs for QMI8658 (PB6/PB7) */
+    GPIO_InitStruct.Pin = I2C_SCL_PIN | I2C_SDA_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
     I2C_SCL_H();
     I2C_SDA_H();
 }

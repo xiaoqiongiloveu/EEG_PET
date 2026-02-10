@@ -38,6 +38,7 @@ static uint32_t last_save_time = 0;
 static uint32_t last_display_time = 0;
 static int current_sps = 250;
 static int current_channel = 1;
+static uint32_t stream_seq_num = 0;
 
 // Impedance Calculation Variables
 static float imp_max_val = -1e9;
@@ -63,6 +64,13 @@ static double cmrr_diff_gain[8];    // Calculated Differential Gain
 // Impedance Test Statistics
 static double imp_sum = 0.0;
 static uint32_t imp_count = 0;
+
+static double rld_sum[8];
+static double rld_sum_sq[8];
+
+// Impedance Test All Channels
+static float imp_all_max[8];
+static float imp_all_min[8];
 
 /* Helper to check text file */
 static int is_txt_file(const char* filename) {
@@ -554,7 +562,7 @@ cmd_response_t cmd_stream_handler(char* args) {
     ADS1299_Set_Sample_Parameter(6, 6, 0); // 250SPS, Gain 24, Normal Input 
    
     // Enable all 8 channels 
-    for(int i=1; i<=8; i++) { 
+    for(int i=2; i<=8; i++) { 
        ADS1299_Write_Reg(0x04 + i, 0x60); // Gain 24, Normal Input 
     } 
    
@@ -577,6 +585,7 @@ cmd_response_t cmd_stream_handler(char* args) {
 
     app_state = APP_STREAM_RUNNING;
     start_time = HAL_GetTick();
+    stream_seq_num = 0;
     sample_count = 0;
     last_save_time = start_time;
     last_display_time = start_time;
@@ -617,7 +626,7 @@ void app_run_loop(void) {
         return;
     }
 
-    if (app_state == APP_SINGLE_RUNNING || app_state == APP_QUAD_RUNNING || app_state == APP_STREAM_RUNNING || app_state == APP_IMP_TEST_RUNNING || app_state == APP_NOISE_TEST_RUNNING || app_state == APP_CMRR_TEST_RUNNING || app_state == APP_CMRR_STEP1_RUNNING || app_state == APP_CMRR_STEP2_RUNNING) 
+    if (app_state == APP_SINGLE_RUNNING || app_state == APP_QUAD_RUNNING || app_state == APP_STREAM_RUNNING || app_state == APP_IMP_TEST_RUNNING || app_state == APP_NOISE_TEST_RUNNING || app_state == APP_CMRR_TEST_RUNNING || app_state == APP_CMRR_STEP1_RUNNING || app_state == APP_CMRR_STEP2_RUNNING || app_state == APP_IMP_TEST_ALL_RUNNING || app_state == APP_RLD_TEST_RUNNING) 
 			{
         
         // --- AUX Data Handling (1Hz) for STREAM mode ---
@@ -658,7 +667,7 @@ void app_run_loop(void) {
         while (circular_buffer_get_data_count(&ADS1299_circula_buffer) >= 27) {
             circular_buffer_read(&ADS1299_circula_buffer, packet, 27);
             
-            char line[256];
+            static char line[256];
             int len = 0;
             
             // Gain 24, Vref=4.5V
@@ -749,6 +758,32 @@ void app_run_loop(void) {
                     }
                 }
             }
+            else if (app_state == APP_RLD_TEST_RUNNING) {
+                // RLD Test: Calculate RMS of AC Component (Standard Deviation)
+                for(int i=0; i<8; i++) {
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    float voltage = (float)val * scale; // uV (Note: scale is uV/LSB in line 673)
+                    
+                    rld_sum[i] += voltage;
+                    rld_sum_sq[i] += (double)(voltage * voltage);
+                }
+
+                if (sample_count >= target_samples - 1) {
+                    USB_Print("\r\n[RLD_TEST] 10s Acquisition Done.\r\n");
+                    USB_Print("CH | Mean (uV) | RMS_AC (uVrms)\r\n");
+                    USB_Print("---|-----------|---------------\r\n");
+                    
+                    for(int i=0; i<8; i++) {
+                        double mean = rld_sum[i] / target_samples;
+                        double variance = (rld_sum_sq[i] / target_samples) - (mean * mean);
+                        double rms_ac = (variance > 0) ? sqrt(variance) : 0.0;
+                        
+                        USB_Print(" %d | %9.2f | %13.3f\r\n", i+1, mean, rms_ac);
+                    }
+                }
+            }
             else if (app_state == APP_NOISE_TEST_RUNNING) {
                 for(int i=0; i<8; i++) {
                     int ch_offset = 3 + i * 3;
@@ -778,6 +813,38 @@ void app_run_loop(void) {
                          USB_Print(" %d | %13.3f | %11.3f | %17.3f\r\n", 
                                    i+1, mean, rms_noise, pp);
                      }
+                }
+            }
+            else if (app_state == APP_IMP_TEST_ALL_RUNNING) {
+                // 8-Channel Impedance Logic
+                for(int i=0; i<8; i++) {
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    float voltage = (float)val * scale; 
+
+                    if (voltage > imp_all_max[i]) imp_all_max[i] = voltage;
+                    if (voltage < imp_all_min[i]) imp_all_min[i] = voltage;
+                }
+                
+                imp_window_count++;
+
+                // Calculate Impedance every 1 second (250 samples)
+                if (imp_window_count >= 250) {
+                    USB_Print("[IMP] ");
+                    for(int i=0; i<8; i++) {
+                        float vpp = imp_all_max[i] - imp_all_min[i]; 
+                        // Z = Vpp(uV) * 1e-6 / (2 * 6nA) = Vpp / 0.012
+                        float impedance = (vpp * 1e-6f) / 12.0e-9f;
+                        
+                        USB_Print("CH%d:%.1fk ", i+1, impedance / 1000.0f);
+                        
+                        // Reset
+                        imp_all_max[i] = -1e9;
+                        imp_all_min[i] = 1e9;
+                    }
+                    USB_Print("\r\n");
+                    imp_window_count = 0;
                 }
             }
             else if (app_state == APP_IMP_TEST_RUNNING) {
@@ -850,12 +917,25 @@ void app_run_loop(void) {
                     voltages[i] = (float)val * scale;
                 }
                 
-                // Format: EEG:v1,v2,v3,v4,v5,v6,v7,v8\n
-                len = snprintf(line, sizeof(line), "EEG:F5:%.2f,F3:%.2f,FZ:%.2f,F4:%.2f,F6:%.2f,AF8:%.2f,FPZ:%.2f,AF7:%.2f\r\n",
-                               voltages[0], voltages[1], voltages[2], voltages[3],
-                               voltages[4], voltages[5], voltages[6], voltages[7]);
+                // Format: EEG:SEQ:x,v1,v2,v3,v4,v5,v6,v7,v8\n
+								len = snprintf(line, sizeof(line), "EEG:F5:%.2f,F3:%.2f,FZ:%.2f,F4:%.2f,F6:%.2f,AF8:%.2f,FPZ:%.2f,AF7:%.2f\r\n",
+                               voltages[1], voltages[1], voltages[2], voltages[3],
+                               voltages[4], voltages[5], voltages[6], voltages[7]);//复制了一份通道二给通道1
+//                len = snprintf(line, sizeof(line), "EEG:SEQ:%lu,F5:%.2f,F3:%.2f,FZ:%.2f,F4:%.2f,F6:%.2f,AF8:%.2f,FPZ:%.2f,AF7:%.2f\r\n",
+//                               stream_seq_num++,
+//                               voltages[0], voltages[1], voltages[2], voltages[3],
+//                               voltages[4], voltages[5], voltages[6], voltages[7]);
+//								len = snprintf(line, sizeof(line), "EEG:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+//                               voltages[0], voltages[1], voltages[2], voltages[3],
+//                               voltages[4], voltages[5], voltages[6], voltages[7]);
                 
-                CDC_Transmit_FS((uint8_t*)line, len);
+                // Transmit with simple retry for reliability
+                if (CDC_Transmit_FS((uint8_t*)line, len) == USBD_BUSY) {
+                    uint32_t retry_start = HAL_GetTick();
+                    while (CDC_Transmit_FS((uint8_t*)line, len) == USBD_BUSY) {
+                        if (HAL_GetTick() - retry_start > 2) break; // 2ms timeout
+                    }
+                }
             } else {
                 // QUAD (8-channel) mode
                 float voltages[8];
@@ -1027,6 +1107,60 @@ cmd_response_t cmd_test_imp_handler(char* args) {
     imp_count = 0;
 
     strcpy(response.message, "OK: TEST_IMP Started (CH1)");
+    return response;
+}
+
+cmd_response_t cmd_test_imp_all_handler(char* args) {
+    cmd_response_t response = {1, ""};
+
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: Acquisition already running");
+        return response;
+    }
+
+    ADS1299_Stop();
+    HAL_Delay(10);
+
+    // Manual Register Configuration for Impedance Test (All Channels)
+    ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal test signal generation
+    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: Internal reference buffer enabled, VREF = 4.5V
+    ADS1299_Write_Reg(0x04, 0x01); // LOFF: 24nA Current, AC Lead-off at fDR/4
+
+    // Enable all 8 channels (Gain 24, Normal Input)
+    for(int i=1; i<=8; i++) {
+        ADS1299_Write_Reg(0x04 + i, 0x60); 
+    }
+
+    ADS1299_Write_Reg(0x0D, 0x00); // BIAS_SENSP
+    ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
+    ADS1299_Write_Reg(0x0F, 0xFF); // LOFF_SENSP: All P inputs enabled for LOFF
+    ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
+    ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
+    ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1 connected to all N inputs
+    ADS1299_Write_Reg(0x17, 0x02); // CONFIG4: PD_LOFF_COMP enabled
+
+    USB_Print("[TEST_IMP_ALL] Registers Configured (8CH).\r\n");
+    
+    // Start Acquisition
+    ADS1299_Start();
+    circular_buffer_clear(&ADS1299_circula_buffer);
+
+    app_state = APP_IMP_TEST_ALL_RUNNING; 
+    start_time = HAL_GetTick();
+    sample_count = 0;
+    target_samples = 60 * 250; // Default 1 min
+    last_display_time = start_time;
+
+    // Reset Impedance Stats
+    for(int i=0; i<8; i++) {
+        imp_all_max[i] = -1e9;
+        imp_all_min[i] = 1e9;
+    }
+    imp_window_count = 0;
+
+    strcpy(response.message, "OK: TEST_IMP_ALL Started (8CH)");
     return response;
 }
 
@@ -1265,7 +1399,7 @@ cmd_response_t cmd_get_state_handler(char* args) {
     int usb_ok = (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) ? 1 : 0;
 
     USB_Print("\r\n=== DEVICE STATE REPORT ===\r\n");
-    USB_Print("SN: AIT2601X04567\r\n");
+    USB_Print("SN: AIT2601X04566\r\n");
     USB_Print("VERSION:T1.0.0\r\n");
     USB_Print("Battery: %.1f%%\r\n", Battery_Voltage);
     USB_Print("USB:     %s\r\n", usb_ok ? "CONNECTED" : "DISCONNECTED");
@@ -1329,6 +1463,97 @@ cmd_response_t cmd_playmusic_handler(char* args) {
     return response;
 }
 
+cmd_response_t cmd_rx_test_handler(char* args) {
+    cmd_response_t response = {1, ""};
+    
+    // Trim spaces
+    while (*args == ' ') args++;
+    
+    if (strcmp(args, "START") == 0 || strcmp(args, "start") == 0) {
+        g_rx_test_count = 0;
+        g_rx_test_last_byte = 0;
+        g_rx_test_mode = 1;
+        sprintf(response.message, "RX Test Mode STARTED. Send 0x0303 packets now.");
+    } 
+    else if (strcmp(args, "STOP") == 0 || strcmp(args, "stop") == 0) {
+        g_rx_test_mode = 0;
+        sprintf(response.message, "RX Test Mode STOPPED. Count: %lu", g_rx_test_count);
+    }
+    else {
+        // Just report status
+        sprintf(response.message, "RX Test Mode: %s, Count: %lu", 
+                g_rx_test_mode ? "ON" : "OFF", g_rx_test_count);
+    }
+    
+    return response;
+}
+
+cmd_response_t cmd_rld_test_handler(char* args) {
+    cmd_response_t response = {1, ""};
+
+    if (app_state != APP_IDLE) {
+        response.success = 0;
+        strcpy(response.message, "ERR: Acquisition already running");
+        return response;
+    }
+
+    ADS1299_Stop();
+    HAL_Delay(10);
+
+    // Manual Register Configuration for RLD Test as per user request
+    // 0x00 ID (Read Only) - Skipped or verified later
+    ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal Test Signal On
+    ADS1299_Write_Reg(0x03, 0xEC); // CONFIG3: PD_REFBUF=1, VREF=4V, RLD_MEAS=1, RLDREF_INT=1, PD_RLD=1, RLD_LOFF=0, RLD_STAT=0
+    ADS1299_Write_Reg(0x04, 0x00); // LOFF: Disabled
+
+    // CHnSET: 0x60 (Gain 24, Normal Input)
+    for(int i=0; i<8; i++) {
+        ADS1299_Write_Reg(0x05 + i, 0x60); 
+    }
+
+    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: All channels connected to Bias (RLD)
+    ADS1299_Write_Reg(0x0E, 0xFF); // BIAS_SENSN: All channels connected to Bias (RLD)
+    ADS1299_Write_Reg(0x0F, 0x00); // LOFF_SENSP
+    ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
+    ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
+    ADS1299_Write_Reg(0x12, 0x00); // LOFF_STATP (RO)
+    ADS1299_Write_Reg(0x13, 0x00); // LOFF_STATN (RO)
+    ADS1299_Write_Reg(0x14, 0x00); // GPIO
+    ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1
+    ADS1299_Write_Reg(0x16, 0x00); // MISC2
+    ADS1299_Write_Reg(0x17, 0x00); // CONFIG4
+
+    USB_Print("[RLD_TEST] Registers Configured for RLD Test (10s).\r\n");
+    
+    // Read back verification (optional, can be helpful)
+    USB_Print("[BOOT] ADS1299 Registers:\r\n");
+    uint8_t regs[24];
+    ADS1299_Read_Regs(0x00, regs, 24);
+    for(int i=0; i<24; i++) {
+        USB_Print("Reg[0x%02X] = 0x%02X\r\n", i, regs[i]);
+        HAL_Delay(2);
+    }
+
+    // Initialize stats
+    for(int i=0; i<8; i++) {
+        rld_sum[i] = 0.0;
+        rld_sum_sq[i] = 0.0;
+    }
+
+    ADS1299_Start();
+    circular_buffer_clear(&ADS1299_circula_buffer);
+
+    app_state = APP_RLD_TEST_RUNNING;
+    start_time = HAL_GetTick();
+    sample_count = 0;
+    target_samples = 10 * 250; // 10 seconds @ 250 SPS
+    last_display_time = start_time;
+
+    strcpy(response.message, "OK: RLD_TEST Started. Please wait 10s...");
+    return response;
+}
+
 void register_all_commands(void) {
   command_system_init();
 
@@ -1348,9 +1573,12 @@ void register_all_commands(void) {
   register_command("REG", cmd_reg_handler, "REG", "Read ADS1299 registers");
   register_command("SWEEP", cmd_sweep_handler, "SWEEP", "AD5933 Freq Sweep");
   register_command("TEST_IMP", cmd_test_imp_handler, "TEST_IMP", "Test Impedance Config");
+  register_command("TEST_IMP_ALL", cmd_test_imp_all_handler, "TEST_IMP_ALL", "Test Impedance (8CH, 1s log)");
   register_command("TEST_NOISE", cmd_test_noise_handler, "TEST_NOISE", "Internal noise test");
   register_command("TEST_CMRR", cmd_test_cmrr_handler, "TEST_CMRR", "CMRR test");
   register_command("TEST_CMRR_FULL", cmd_test_cmrr_full_handler, "TEST_CMRR_FULL:<STEP1|STEP2>", "Full CMRR Test (Two Pass)");
+  register_command("TEST_RX", cmd_rx_test_handler, "TEST_RX:<START|STOP>", "Test USB RX counting 0x0303");
+  register_command("RLD_TEST", cmd_rld_test_handler, "RLD_TEST", "Test RLD suppression (10s)");
   register_command("PLAYMUSIC", cmd_playmusic_handler, "PLAYMUSIC:<filename>", "Play .wav file in AUDIO folder (e.g. PLAYMUSIC:1)");
 
     // USB_Print("[CMD] Command system: Registered %d commands\r\n", 15);

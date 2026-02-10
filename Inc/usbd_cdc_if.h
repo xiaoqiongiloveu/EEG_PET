@@ -96,6 +96,9 @@ extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
 /* USER CODE BEGIN EXPORTED_VARIABLES */
 extern char usb_cmd_buffer[128];
 extern volatile uint8_t usb_cmd_ready;
+extern volatile uint8_t g_rx_test_mode;
+extern volatile uint32_t g_rx_test_count;
+extern volatile uint8_t g_rx_test_last_byte;
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**

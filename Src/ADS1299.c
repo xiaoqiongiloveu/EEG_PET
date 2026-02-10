@@ -90,23 +90,28 @@ void ADS1299_Rest(void)
 void ADS1299_Init(void)
 {
     ADS1299_Rest();
+    
+    // Check ID to verify communication
+    uint8_t id = 0;
+    ADS1299_Read_Regs(0x00, &id, 1);
+    USB_Print("[ADS1299] Device ID Read: 0x%02X\r\n", id);
 
     ADS1299_REG[0x00] = 0x1C;
     ADS1299_REG[0x01] = 0x96;
     ADS1299_REG[0x02] = 0xC0;
-    ADS1299_REG[0x03] = 0xF6; // E6
+    ADS1299_REG[0x03] = 0xEC; // 
     ADS1299_REG[0x04] = 0x00;
 
-    ADS1299_REG[0x05] = 0x50; // 50
-    ADS1299_REG[0x06] = 0x50; //
-    ADS1299_REG[0x07] = 0x50; //
-    ADS1299_REG[0x08] = 0x50; //
-    ADS1299_REG[0x09] = 0x50;
-    ADS1299_REG[0x0A] = 0x50;
-    ADS1299_REG[0x0B] = 0x50;
-    ADS1299_REG[0x0C] = 0x50;
+    ADS1299_REG[0x05] = 0x80; // 
+    ADS1299_REG[0x06] = 0x60; //
+    ADS1299_REG[0x07] = 0x60; //
+    ADS1299_REG[0x08] = 0x60; //
+    ADS1299_REG[0x09] = 0x60;
+    ADS1299_REG[0x0A] = 0x60;
+    ADS1299_REG[0x0B] = 0x60;
+    ADS1299_REG[0x0C] = 0x60;
 
-    ADS1299_REG[0x0D] = 0xFF; // FF
+    ADS1299_REG[0x0D] = 0x7F; // FF : all p to RLD bias
     ADS1299_REG[0x0E] = 0x00; //
     ADS1299_REG[0x0F] = 0x00; //
     ADS1299_REG[0x10] = 0x00; //
@@ -114,8 +119,8 @@ void ADS1299_Init(void)
     ADS1299_REG[0x12] = 0x00; // P Lead-Off Off
     ADS1299_REG[0x13] = 0x00; // N Lead-Off Off
     ADS1299_REG[0x14] = 0x00; // 0f
-    ADS1299_REG[0x15] = 0x20; // SRB1
-    ADS1299_REG[0x16] = 0x00;
+    ADS1299_REG[0x15] = 0x20; // all n connected to SRB1
+    ADS1299_REG[0x16] = 0x00; //
     ADS1299_REG[0x17] = 0x00; // Continuous conversion
 
     ADS1299_Write_Regs(0x01, ADS1299_REG + 1, 23);
@@ -123,12 +128,11 @@ void ADS1299_Init(void)
     HAL_Delay(10);
 
     ADS1299_Read_Regs(0x00, ADS1299_REGt, 24);
-		
 
     ADS1299_REGt[0] &= 0x1F;
 
-    // Wait a bit to ensure USB is ready (optional but safer)
-    HAL_Delay(100); 
+    
+    HAL_Delay(150); //delay 150ms
 
     // Removed USB_Print loop to avoid dependency on usbd_cdc_if.h in driver file if not necessary, 
     // or add #include "usbd_cdc_if.h" if USB logging is desired here.
@@ -170,7 +174,7 @@ void ADS1299_Set_Sample_Parameter(uint8_t dr, uint8_t gain, uint8_t input_type) 
     ch_settings |= ((gain & 0x07) << 4);     // Set Gain
     ch_settings |= (input_type & 0x07);      // Set Input Type (MUX)
     
-    for(int i = 0; i < 8; i++) {
+    for(int i = 1; i < 8; i++) {
         ADS1299_Write_Reg(ADS1299_CH1SET + i, ch_settings);
     }
 }
