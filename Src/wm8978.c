@@ -104,6 +104,7 @@ uint8_t WM8978_Init(void)
   * @param  dacen: 1=Enable DAC, 0=Disable
   * @param  adcen: 1=Enable ADC, 0=Disable
   */
+
 void WM8978_ADDA_Cfg(uint8_t dacen, uint8_t adcen)
 {
     uint16_t regval;

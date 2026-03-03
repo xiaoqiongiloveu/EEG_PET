@@ -102,7 +102,7 @@ void ADS1299_Init(void)
     ADS1299_REG[0x03] = 0xEC; // 
     ADS1299_REG[0x04] = 0x00;
 
-    ADS1299_REG[0x05] = 0x80; // 
+    ADS1299_REG[0x05] = 0x60; // 
     ADS1299_REG[0x06] = 0x60; //
     ADS1299_REG[0x07] = 0x60; //
     ADS1299_REG[0x08] = 0x60; //
@@ -111,7 +111,7 @@ void ADS1299_Init(void)
     ADS1299_REG[0x0B] = 0x60;
     ADS1299_REG[0x0C] = 0x60;
 
-    ADS1299_REG[0x0D] = 0x7F; // FF : all p to RLD bias
+    ADS1299_REG[0x0D] = 0xFF; // FF : all p to RLD bias
     ADS1299_REG[0x0E] = 0x00; //
     ADS1299_REG[0x0F] = 0x00; //
     ADS1299_REG[0x10] = 0x00; //

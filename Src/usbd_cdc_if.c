@@ -132,7 +132,7 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-
+#include "command_system.h"
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -268,6 +268,12 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   
+  // File Transfer Hook
+  if (g_file_transfer_mode) {
+      handle_file_transfer(Buf, *Len);
+      return (USBD_OK);
+  }
+  
   if (g_rx_test_mode) {
         for (uint32_t i = 0; i < *Len; i++) {
             uint8_t current_byte = Buf[i];
@@ -283,9 +289,9 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
     
     static uint8_t is_new_command = 1;
     
-    if (is_new_command && usb_cmd_index > 0) {
-        usb_cmd_index = 0;
-    }
+    // if (is_new_command && usb_cmd_index > 0) {
+    //    usb_cmd_index = 0;
+    // }
     
     for(uint32_t i = 0; i < *Len; i++) {
         uint8_t rx_byte = Buf[i];
@@ -297,11 +303,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
             continue;
         }
       
-      if (rx_byte != '\n' && usb_cmd_index < sizeof(usb_cmd_buffer)-1) {
-          usb_cmd_buffer[usb_cmd_index++] = rx_byte;
-          is_new_command = 0;
-      } 
-      else if (rx_byte == '\n') {
+      if (rx_byte == '\n') {
           usb_cmd_buffer[usb_cmd_index] = '\0'; 
           
           if (usb_cmd_index > 0) {
@@ -311,6 +313,10 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
           usb_cmd_index = 0;
           is_new_command = 1;  
       }
+      else if (usb_cmd_index < sizeof(usb_cmd_buffer)-1) {
+          usb_cmd_buffer[usb_cmd_index++] = rx_byte;
+          is_new_command = 0;
+      } 
   }
   
   return (USBD_OK);

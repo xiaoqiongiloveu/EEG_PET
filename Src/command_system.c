@@ -32,6 +32,19 @@ void command_system_init(void) {
     }
     
     command_count = 0;
+
+    /* Register system commands */
+    /* Note: These handlers should be declared in a header or extern'd here */
+    extern cmd_response_t cmd_ota_apply_handler(char*);
+    extern cmd_response_t cmd_power_test_handler(char*);
+    extern cmd_response_t cmd_adc_test_handler(char*);
+    extern cmd_response_t cmd_stop_handler(char*);
+
+    register_command("OTA_APPLY", cmd_ota_apply_handler, "OTA_APPLY", "Apply OTA Update (Restart)");
+    register_command("POWER_TEST", cmd_power_test_handler, "POWER_TEST", "Enable all peripherals for power test");
+    register_command("ADCTEST", cmd_adc_test_handler, "ADCTEST", "Log Battery ADC to SD card (0.5s)");
+    register_command("STOP", cmd_stop_handler, "STOP", "Stop running command");
+
     // USB_SendString("[CMD] Command system initialized successfully\r\n");
 }
 

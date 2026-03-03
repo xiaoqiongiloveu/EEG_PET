@@ -1,0 +1,50 @@
+# AI Bootloader Implementation Guide
+
+This project is a Bootloader for STM32L452. It needs to check for a firmware update file on the SD card, flash it to the application area, and then jump to the application.
+
+## Prerequisites
+- The project has been generated with STM32CubeMX.
+- **SDMMC1** is configured (SD 4 bits wide).
+- **FATFS** is enabled (SD Card mode).
+- A reference implementation is provided in `Bootloader_Reference.c`.
+
+## Task: Integrate Bootloader Logic
+Please complete the following steps to make the Bootloader functional:
+
+1.  **Locate `Bootloader_Reference.c`**:
+    - This file contains the core logic function `Bootloader_Process()`.
+    - It handles:
+        - Mounting the SD card.
+        - Checking for `update.bin`.
+        - Erasing the Application Flash area (starting at `0x08008000`).
+        - Flashing the new firmware.
+        - Deleting the update file after success.
+        - Jumping to the Application at `0x08008000`.
+
+2.  **Modify `main.c`**:
+    - Open `Src/main.c`.
+    - **Copy the Logic**: Open `Bootloader_Reference.c` and copy the entire `Bootloader_Process` function (including the `#define APP_ADDRESS` and typedefs) into `main.c`. Place it in the `/* USER CODE BEGIN 0 */` section or similar user code area before `main()`.
+    - **Add Includes**: Ensure `#include "string.h"` and `#include "fatfs.h"` are present in `main.c` (User Code Includes section).
+
+3.  **Call the Function**:
+    - In the `main()` function, find the initialization sequence.
+    - After `MX_FATFS_Init();` and before the `while(1)` loop, add the function call:
+      ```c
+      /* USER CODE BEGIN 2 */
+      Bootloader_Process();
+      /* USER CODE END 2 */
+      ```
+
+4.  **Verify Configuration**:
+    - Ensure `APP_ADDRESS` is defined as `0x08008000` (matching the Application's Linker Script).
+    - Ensure the SD card initialization (`MX_SDMMC1_SD_Init`) and FATFS initialization (`MX_FATFS_Init`) are called *before* `Bootloader_Process()`.
+
+5.  **Clean Up (Optional)**:
+    - If there are any residual interrupt handlers (e.g., `DMA2_Channel4_IRQHandler` in `stm32l4xx_it.c`) from previous configurations that are no longer used (e.g., if DMA was disabled), please comment them out or remove them to prevent compilation errors.
+
+## Goal
+The final code should compile without errors. When run, it should:
+1. Initialize SD card.
+2. Check for `update.bin`.
+3. If found -> Flash it -> Delete it -> Jump to App.
+4. If not found -> Jump to App immediately.

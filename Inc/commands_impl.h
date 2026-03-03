@@ -21,7 +21,10 @@ typedef enum {
     APP_NOISE_TEST,
     APP_CMRR_TEST,
     APP_SQUARE_WAVE_TEST,
-    APP_RLD_TEST_RUNNING
+    APP_RLD_TEST_RUNNING,
+    APP_AUTO_STREAM_RUNNING,
+    APP_POWER_TEST_RUNNING,
+    APP_ADC_TEST_RUNNING
 } AppState;
 
 extern volatile AppState app_state;
@@ -31,6 +34,8 @@ void register_all_commands(void);
 cmd_response_t cmd_get_handler(char* args);
 cmd_response_t cmd_list_handler(char* args);
 cmd_response_t cmd_diag_handler(char* args);
+cmd_response_t cmd_conf_handler(char* args);
+cmd_response_t cmd_auto_stream_handler(char* args);
 
 // Other helper functions
 void app_run_loop(void);

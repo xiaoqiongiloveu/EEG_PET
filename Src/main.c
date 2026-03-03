@@ -79,6 +79,8 @@ uint8_t sd_mounted = 0;    // Flag for SD mount status
 uint8_t file_opened = 0;   // Flag for file open status
 
 float Battery_Voltage = 0.0f;
+float batt_raw_vol = 0.0f; // Stores raw voltage in Volts for low battery check
+uint8_t low_batt_cnt = 0;  // Counter for low battery debounce
 float acc[3], gyro[3];
 uint32_t last_qmi_print = 0;
 uint8_t wm8978_initialized = 0;
@@ -103,6 +105,7 @@ void USB_SendString(const char* str);
 void Power_Control_Init(void);
 void Check_Power_Off(void);
 void Update_Battery_Voltage(void);
+void Low_Battery_Check(void);
 void Send_AUX_Packet(float *acc, float *gyro, float vbat);
 /* USER CODE END PFP */
 
@@ -183,6 +186,14 @@ void SD_Init_Process(void)
     
     USB_Print("[SD] Test Complete.\r\n");
     
+    // 4. Clean up OTA firmware file to prevent re-flashing loop
+    FILINFO fno_ota;
+    if (f_stat("update.bin", &fno_ota) == FR_OK) {
+        USB_Print("[BOOT] Found old update.bin, deleting...\r\n");
+        f_unlink("update.bin");
+        USB_Print("[BOOT] update.bin deleted.\r\n");
+    }
+
     // Prepare data.bin for logging (optional, if we were logging)
     // res = f_open(&SDFile, "data.bin", FA_OPEN_APPEND | FA_WRITE);
     // if(res == FR_OK) file_opened = 1;
@@ -266,10 +277,36 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  // 1. Disable Interrupts (Safety measure)
+  __disable_irq();
+
+  // 3. De-init RCC (Reset Clock to default)
+  HAL_RCC_DeInit();
+  
+  // 3.1 Force Vector Table Offset (Critical for Bootloader Jump)
+  SCB->VTOR = FLASH_BASE | 0x8000;
+
+  // 4. Init HAL (Configures SysTick, etc.)
   HAL_Init();
+  
+  // CRITICAL: Kick Watchdog immediately
+  IWDG->KR = 0xAAAA;
+  
+  // CRITICAL: Lock Power ON immediately (Software Power Latch)
+  // Enable GPIOA Clock first (in case it was disabled)
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = POWER_CTRL_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(POWER_CTRL_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_SET);
+  
+  // 5. Re-enable Interrupts
+  __enable_irq();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -284,6 +321,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
@@ -309,6 +347,10 @@ int main(void)
   // 3. App Init (CLI, Buffers)
   User_App_Init();
   
+  USB_Print("\r\n=================================\r\n");
+  USB_Print("   APP FIRMWARE VERSION: 2.0   \r\n");
+  USB_Print("=================================\r\n");
+  
   // Play 1.wav after init
   Wav_Play("AUDIO/1.wav");
   while(is_playing) {
@@ -319,8 +361,19 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t led_blink_tick = 0;
+  
   while (1)
   {
+    IWDG->KR = 0xAAAA; // Feed Dog
+    
+    // Heartbeat LED: Blink every 1 second (500ms ON, 500ms OFF)
+//    if (HAL_GetTick() - led_blink_tick >= 500) 
+//		{
+//        HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
+//        led_blink_tick = HAL_GetTick();
+//    }
+    
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -334,7 +387,6 @@ int main(void)
     // Process WAV double buffer filling
     Wav_Process();
     
-//    
     Check_Power_Off();
 
     // 1. Check for new EEG Data (250Hz)
@@ -344,19 +396,27 @@ int main(void)
 //        Send_EEG_Packet(packet);
 //    }
 
-//    // 2. Check for AUX Data (1Hz)
-//    if (HAL_GetTick() - last_qmi_print >= 1000) {
-//        // Read IMU
-//        QMI8658_Read_XYZ(acc, gyro);
-//        
-//        // Read Battery
-//        Update_Battery_Voltage();
-//        
-//        // Send Packet
-//        Send_AUX_Packet(acc, gyro, Battery_Voltage);
-//        
-//        last_qmi_print = HAL_GetTick();
-//    }
+    // 2. Check for AUX Data (1Hz)
+    // Always run battery check and low battery protection
+    if (HAL_GetTick() - last_qmi_print >= 1000) {
+        // Read IMU
+        QMI8658_Read_XYZ(acc, gyro);
+        
+        // Read Battery
+        Update_Battery_Voltage();
+
+        // Check Low Battery (New)
+        Low_Battery_Check();
+        
+        // Send Packet (Only if not in Stream mode, or maybe always? 
+        // Original code commented this out to avoid conflict.
+        // Let's keep Send_AUX_Packet commented out here if Stream mode handles it, 
+        // OR better yet, let Stream mode read the global variables.)
+        
+        // Send_AUX_Packet(acc, gyro, Battery_Voltage); 
+        
+        last_qmi_print = HAL_GetTick();
+    }
   }
   /* USER CODE END 3 */
 }
@@ -485,7 +545,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_640CYCLES_5; // Increased sampling time to reduce noise
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -794,7 +854,7 @@ void Power_Control_Init(void) {
                 if (HAL_GetTick() - press_start >= 2000) {
                     // Confirm press for 2 seconds -> Power ON
                     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_SET); // Latch Power (PA4 High)
-                    HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET); // LED On (Active Low)
+                    HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET); // LED On (Active Low) -> Moved to main loop for blinking
                     return;
                 }
             }
@@ -835,10 +895,13 @@ void Update_Battery_Voltage(void) {
         uint32_t raw = HAL_ADC_GetValue(&hadc1);
         
         // Use user-defined calibration formula
-        Battery_Voltage = ((float)raw * 3.3f / 4095.0f) + 1.0f;
+        // Updated formula based on 4.2V (Raw 4031) and 3.7V (Raw 3519) measurements
+        float voltage = ((float)raw * 0.00097656f) + 0.2635f;
+        
+        batt_raw_vol = voltage; // Update raw voltage for low battery check
         
         // Convert to percentage: 3.6V = 0%, 4.1V = 100%
-        float percentage = (Battery_Voltage - 3.6f) / (4.1f - 3.6f) * 100.0f;
+        float percentage = (voltage - 3.6f) / (4.1f - 3.6f) * 100.0f;
         
         if (percentage < 0.0f) percentage = 0.0f;
         if (percentage > 100.0f) percentage = 100.0f;
@@ -847,6 +910,40 @@ void Update_Battery_Voltage(void) {
         Battery_Voltage = percentage;
     }
     HAL_ADC_Stop(&hadc1);
+}
+
+void Low_Battery_Check(void) {
+    // Check every second (called in main loop along with Update_Battery_Voltage)
+    // Threshold: 3.5V
+    if (batt_raw_vol < 3.5f && batt_raw_vol > 1.0f) { // > 1.0f to avoid triggering on 0V (e.g. startup)
+        low_batt_cnt++;
+        if (low_batt_cnt >= 5) { // 5 seconds continuous low
+            USB_Print("[PWR] Low Battery (%.2fV). Shutting down...\r\n", batt_raw_vol);
+            
+            // Play Shutdown Sound
+            Wav_Play("AUDIO/2.wav");
+            while(is_playing) {
+                Wav_Process();
+            }
+            
+            // Perform Shutdown Sequence
+            ADS1299_Stop();
+            f_close(&SDFile);
+            
+            // Blink LED rapidly
+            for(int i=0; i<10; i++) {
+                HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
+                HAL_Delay(100);
+            }
+            HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
+            
+            // Cut Power
+            HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET);
+            while(1);
+        }
+    } else {
+        low_batt_cnt = 0;
+    }
 }
 
 void Send_AUX_Packet(float *acc, float *gyro, float vbat) {

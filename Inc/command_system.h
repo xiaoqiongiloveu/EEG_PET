@@ -53,6 +53,10 @@ void trim_string(char* str);
 char* split_command_args(char* input, char** args);
 char* resolve_command_alias(const char* input);
 
+/* File Transfer Interface */
+extern volatile uint8_t g_file_transfer_mode;
+void handle_file_transfer(uint8_t* buf, uint32_t len);
+
 /* History (Optional) */
 void add_to_history(const char* cmd);
 void show_history(void);
