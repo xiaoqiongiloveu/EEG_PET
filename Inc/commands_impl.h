@@ -37,6 +37,8 @@ cmd_response_t cmd_diag_handler(char* args);
 cmd_response_t cmd_conf_handler(char* args);
 cmd_response_t cmd_auto_stream_handler(char* args);
 
+cmd_response_t cmd_test_imp_all_handler(char* args);
+
 // Other helper functions
 void app_run_loop(void);
 

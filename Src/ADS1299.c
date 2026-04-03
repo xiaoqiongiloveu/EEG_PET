@@ -145,7 +145,8 @@ void ADS1299_Init(void)
     for(uint8_t n=0;n<24;n++)
     {
         USB_Print("ADS1299_reg[0x%x] = 0x%x \r\n",n,ADS1299_REGt[n]);
-        HAL_Delay(10); 
+        // HAL_Delay(10); // Don't use HAL_Delay in init if called from interrupt (though Init usually isn't)
+        for(volatile int w=0; w<10000; w++); 
     }
 
     ADS1299_SPI_Rate_Set(SPI_BAUDRATEPRESCALER_16);

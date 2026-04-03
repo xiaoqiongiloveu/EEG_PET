@@ -22,7 +22,8 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
-
+#include "binary_protocol.h" // New Protocol
+#include <string.h>
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,8 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-
+BP_Parser_t bp_parser; // Binary Parser Instance
+extern void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* payload, uint16_t len);
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -97,6 +99,7 @@ uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 char usb_cmd_buffer[128];
 volatile uint8_t usb_cmd_ready = 0;
 uint16_t usb_cmd_index = 0;
+volatile uint8_t g_usb_host_connected = 0; // 0 = Disconnected, 1 = Connected (DTR high)
 /* USER CODE END PRIVATE_VARIABLES */
 
 /**
@@ -232,7 +235,12 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
     break;
 
     case CDC_SET_CONTROL_LINE_STATE:
-
+      // pbuf[2] contains the DTR and RTS bits. Bit 0 is DTR.
+      if (pbuf[2] & 0x01) {
+          g_usb_host_connected = 1; // Host opened the COM port
+      } else {
+          g_usb_host_connected = 0; // Host closed the COM port
+      }
     break;
 
     case CDC_SEND_BREAK:
@@ -274,6 +282,13 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       return (USBD_OK);
   }
   
+  // Initialize Binary Parser
+  static uint8_t parser_initialized = 0;
+  if (!parser_initialized) {
+      BP_Init(&bp_parser, BP_Command_Callback);
+      parser_initialized = 1;
+  }
+  
   if (g_rx_test_mode) {
         for (uint32_t i = 0; i < *Len; i++) {
             uint8_t current_byte = Buf[i];
@@ -289,12 +304,17 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
     
     static uint8_t is_new_command = 1;
     
-    // if (is_new_command && usb_cmd_index > 0) {
-    //    usb_cmd_index = 0;
-    // }
-    
     for(uint32_t i = 0; i < *Len; i++) {
         uint8_t rx_byte = Buf[i];
+
+        // 1. Feed Binary Parser
+        BP_ProcessByte(&bp_parser, rx_byte);
+        
+        // 2. If Binary Parser is confident (past header), block ASCII
+        // SYNC1/SYNC2 states are too common, don't block ASCII yet
+        if (bp_parser.state >= BP_STATE_LEN1) {
+            continue; 
+        }
 
         // In test mode, ignore 0x03 to prevent buffer overflow
         if (g_rx_test_mode && rx_byte == 0x03) continue;
@@ -339,11 +359,29 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
+  
   if (hcdc->TxState != 0){
     return USBD_BUSY;
   }
-  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
+  
+  // FIX: Copy data to static buffer to prevent stack corruption
+  if (Len > APP_TX_DATA_SIZE) {
+      return USBD_FAIL;
+  }
+  
+  // Critical Section only around memcpy and TransmitPacket to prevent race conditions
+  __disable_irq();
+  
+  if (hcdc->TxState != 0){
+      __enable_irq();
+      return USBD_BUSY;
+  }
+
+  memcpy(UserTxBufferFS, Buf, Len);
+  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, Len);
   result = USBD_CDC_TransmitPacket(&hUsbDeviceFS);
+  
+  __enable_irq();
   /* USER CODE END 7 */
   return result;
 }

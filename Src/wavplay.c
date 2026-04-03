@@ -203,6 +203,9 @@ uint8_t Wav_Play(const char* fname) {
     uint8_t res;
     // uint32_t br;
 
+    // Force stop any ongoing playback to prevent FATFS handle corruption or DMA deadlock
+    Wav_Stop();
+
     USB_Print("[WAV] Parsing %s...\r\n", fname);
     res = Wav_ParseHeader(fname);
     if (res != 0) {

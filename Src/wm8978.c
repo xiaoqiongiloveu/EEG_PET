@@ -72,8 +72,8 @@ uint8_t WM8978_Init(void)
     // R2: ROUT1EN=1, LOUT1EN=1, BOOSTENR=1, BOOSTENL=1
     WM8978_Write_Reg(2, 0X1B0);
     
-    // R3: LOUT2EN=0, ROUT2EN=0, RMIXEN=1, LMIXEN=1 (Output to Headphone Only)
-    WM8978_Write_Reg(3, 0X0C);
+    // R3: LOUT2EN=1, ROUT2EN=1, RMIXEN=1, LMIXEN=1 (Output to Headphone and Speaker)
+    WM8978_Write_Reg(3, 0X6C);
     
     // R6: MCLK Source (Keep default, typically MCLK input)
     WM8978_Write_Reg(6, 0);
@@ -143,10 +143,10 @@ void WM8978_Input_Cfg(uint8_t micen, uint8_t lineinen, uint8_t auxen)
     WM8978_Write_Reg(44, regval);
     
     if (lineinen) WM8978_LINEIN_Gain(5); // 0dB
-    else          WM8978_LINEIN_Gain(0); // Mute
+    else          WM8978_LINEIN_Gain(7); // -15dB (Min Gain) to suppress noise
     
-    if (auxen)    WM8978_AUX_Gain(7);    // 6dB
-    else          WM8978_AUX_Gain(0);    // Mute
+    if (auxen)    WM8978_AUX_Gain(0);    // +6dB (Max Gain)
+    else          WM8978_AUX_Gain(7);    // -15dB (Min Gain) to suppress noise
 }
 
 /**

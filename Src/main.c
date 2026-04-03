@@ -34,6 +34,7 @@
 #include <string.h>
 #include "command_system.h"
 #include "commands_impl.h"
+#include "binary_protocol.h" // Added for BP_CMD definitions
 #include "ad5933.h"
 #include "wm8978.h"
 #include "wavplay.h"
@@ -250,7 +251,7 @@ void User_Device_Init(void)
         WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
         WM8978_Output_Cfg(1, 0);    // Enable DAC Output
         WM8978_HPvol_Set(63, 63);   // Headphone Volume (Max 63)
-        // WM8978_SPKvol_Set(63);      // Speaker Volume (Disabled)
+        WM8978_SPKvol_Set(63);      // Speaker Volume (Max 63)
     } else {
         wm8978_initialized = 0;
         USB_Print("[BOOT] WM8978 Init Failed!\r\n");
@@ -347,8 +348,20 @@ int main(void)
   // 3. App Init (CLI, Buffers)
   User_App_Init();
   
+  // Check if device is disabled via SD card flag
+  {
+      extern FIL SDFile;
+      // Close any potentially opened file first just in case
+      f_close(&SDFile); 
+      if (f_open(&SDFile, "disabled.bin", FA_READ) == FR_OK) {
+          f_close(&SDFile);
+          extern volatile uint8_t g_task_state;
+          g_task_state = 99; // Set device to disabled state immediately on boot
+      }
+  }
+  
   USB_Print("\r\n=================================\r\n");
-  USB_Print("   APP FIRMWARE VERSION: 2.0   \r\n");
+  USB_Print("   APP FIRMWARE VERSION: T1.0.1   \r\n");
   USB_Print("=================================\r\n");
   
   // Play 1.wav after init
@@ -381,44 +394,339 @@ int main(void)
         usb_cmd_ready = 0;
         process_command_ex(usb_cmd_buffer);
     }
-    
-    app_run_loop();
-    
-    // Process WAV double buffer filling
-    Wav_Process();
-    
-    Check_Power_Off();
 
-    // 1. Check for new EEG Data (250Hz)
-//    if (circular_buffer_get_data_count(&ADS1299_circula_buffer) >= 27) {
-//        uint8_t packet[27];
-//        circular_buffer_read(&ADS1299_circula_buffer, packet, 27);
-//        Send_EEG_Packet(packet);
-//    }
+    // Process OTA Buffer (Write to SD Card)
+    extern void process_ota_data(void);
+    process_ota_data();
 
-    // 2. Check for AUX Data (1Hz)
-    // Always run battery check and low battery protection
+    // Check for pending Binary Protocol Commands (Deferred from USB Interrupt)
+     extern volatile uint8_t g_pending_binary_cmd;
+     extern char g_pending_filename[]; // Defined in command_system.c
+     extern uint32_t g_pending_ota_size;
+     extern uint32_t g_pending_ota_crc; // Added CRC
+
+     if (g_pending_binary_cmd != 0) {
+         uint8_t cmd = g_pending_binary_cmd;
+         g_pending_binary_cmd = 0; // Clear flag
+        
+        if (cmd == BP_CMD_START_STREAM) {
+             extern volatile uint8_t g_use_binary_protocol;
+             g_use_binary_protocol = 1;
+             extern cmd_response_t cmd_stream_handler(char*);
+             cmd_stream_handler(NULL);
+        }
+        else if (cmd == BP_CMD_STOP_STREAM) {
+             extern cmd_response_t cmd_stop_handler(char*);
+             cmd_stop_handler(NULL);
+        }
+        else if (cmd == BP_CMD_TEST_IMP) {
+            // Impedance Test command (0x0E)
+            extern cmd_response_t cmd_test_imp_all_handler(char* args);
+            cmd_response_t resp = cmd_test_imp_all_handler(NULL);
+            BP_SendResponse(BP_CMD_TEST_IMP, resp.success ? BP_RESP_OK : BP_RESP_ERR, resp.message);
+        }
+        else if (cmd == BP_CMD_DISABLE_DEVICE) {
+            // Write a "disabled.bin" file to SD card
+            extern FIL SDFile;
+            // Force close any existing open file to prevent FR_DENIED (6)
+            f_close(&SDFile);
+            
+            FRESULT fr = f_open(&SDFile, "disabled.bin", FA_CREATE_ALWAYS | FA_WRITE);
+            if (fr == FR_OK) {
+                uint8_t dummy = 1;
+                UINT bw;
+                f_write(&SDFile, &dummy, 1, &bw);
+                // Ensure data is written to disk
+                f_sync(&SDFile);
+                f_close(&SDFile);
+                extern volatile uint8_t g_task_state;
+                g_task_state = 99; // Set device to disabled state immediately
+                BP_SendResponse(BP_CMD_DISABLE_DEVICE, BP_RESP_OK, "Device Disabled");
+            } else {
+                // Formatting the error code into the string to help debugging
+                char err_msg[32];
+                snprintf(err_msg, sizeof(err_msg), "SD Write Failed (%d)", fr);
+                BP_SendResponse(BP_CMD_DISABLE_DEVICE, BP_RESP_ERR, err_msg);
+            }
+        }
+        else if (cmd == BP_CMD_ENABLE_DEVICE) {
+            // Delete the "disabled.bin" file from SD card
+            extern FIL SDFile;
+            f_close(&SDFile); // Force close
+            
+            if (f_unlink("disabled.bin") == FR_OK) {
+                extern volatile uint8_t g_task_state;
+                if (g_task_state == 99) g_task_state = 0; // Clear disabled state
+                BP_SendResponse(BP_CMD_ENABLE_DEVICE, BP_RESP_OK, "Device Enabled");
+            } else {
+                BP_SendResponse(BP_CMD_ENABLE_DEVICE, BP_RESP_ERR, "SD Unlink Failed or File Not Found");
+            }
+        }
+        else if (cmd == BP_CMD_AUTO_STREAM) {
+             extern volatile uint8_t g_use_binary_protocol;
+             g_use_binary_protocol = 1;
+             extern cmd_response_t cmd_auto_stream_handler(char*);
+             // Default to "EEG_DATA.TXT" if no args
+             cmd_auto_stream_handler("EEG_DATA.TXT");
+        }
+        else if (cmd == BP_CMD_AUDIO_ROUTE) {
+             extern volatile uint8_t g_audio_route;
+             if (g_audio_route == 0) { // Both
+                 WM8978_SPKvol_Set(63);
+                 WM8978_HPvol_Set(63, 63);
+             } else if (g_audio_route == 1) { // Speaker only
+                 WM8978_HPvol_Set(0, 0); // Mute HP
+                 WM8978_SPKvol_Set(63);  // Unmute SPK
+             } else if (g_audio_route == 2) { // Headphone only
+                 WM8978_SPKvol_Set(0);   // Mute SPK
+                 WM8978_HPvol_Set(63, 63); // Unmute HP
+             }
+        }
+        else if (cmd == BP_CMD_LIST_FILES) {
+             // List files
+             DIR dir;
+             FILINFO fno;
+             FRESULT fr = f_opendir(&dir, "/");
+             if (fr == FR_OK) {
+                 char file_list[512] = {0}; // Max buffer
+                 int offset = 0;
+                 for (;;) {
+                     fr = f_readdir(&dir, &fno);
+                     if (fr != FR_OK || fno.fname[0] == 0) break;
+                     if (fno.fattrib & AM_DIR) continue; // Skip directories
+                     
+                     // Format: Name|Size;
+                     int len = snprintf(file_list + offset, sizeof(file_list) - offset, "%s|%lu;", fno.fname, fno.fsize);
+                     if (len > 0) offset += len;
+                     if (offset >= sizeof(file_list) - 32) break; // Avoid overflow
+                 }
+                 f_closedir(&dir);
+                 
+                 // Send Response with File List
+                 uint8_t tx_buf[544];
+                 uint8_t payload[512];
+                 payload[0] = BP_CMD_LIST_FILES;
+                 payload[1] = BP_RESP_OK;
+                 if (offset > 508) offset = 508; // Safe cap
+                 memcpy(&payload[2], file_list, offset);
+                 
+                 uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, payload, 2 + offset);
+                 CDC_Transmit_FS(tx_buf, tx_len);
+             } else {
+                 BP_SendResponse(BP_CMD_LIST_FILES, BP_RESP_ERR, "Open Dir Failed");
+             }
+        }
+        else if (cmd == BP_CMD_DELETE_FILE) {
+             FRESULT fr = f_unlink(g_pending_filename);
+             if (fr == FR_OK) {
+                 char msg[64];
+                 snprintf(msg, sizeof(msg), "Deleted %s", g_pending_filename);
+                 BP_SendResponse(BP_CMD_DELETE_FILE, BP_RESP_OK, msg);
+             } else {
+                 char msg[64];
+                 snprintf(msg, sizeof(msg), "Del Fail %d", fr);
+                 BP_SendResponse(BP_CMD_DELETE_FILE, BP_RESP_ERR, msg);
+             }
+        }
+        else if (cmd == BP_CMD_CLEAR_DATA) {
+             DIR dir;
+             FILINFO fno;
+             FRESULT fr;
+             int deleted_count = 0;
+             int deleted_in_pass;
+             do {
+                 deleted_in_pass = 0;
+                 fr = f_opendir(&dir, "/");
+                 if (fr == FR_OK) {
+                     for (;;) {
+                         fr = f_readdir(&dir, &fno);
+                         if (fr != FR_OK || fno.fname[0] == 0) break;
+                         if (fno.fattrib & AM_DIR) continue; // Skip directories
+                         
+                         // Check if it's a target file (.BIN or .TXT)
+                         if (strstr(fno.fname, ".BIN") != NULL || strstr(fno.fname, ".TXT") != NULL ||
+                             strstr(fno.fname, ".bin") != NULL || strstr(fno.fname, ".txt") != NULL) {
+                             
+                             // Exclude protected files
+                              if (strcmp(fno.fname, "update.bin") != 0 && strcmp(fno.fname, "UPDATE.BIN") != 0 &&
+                                  strcmp(fno.fname, "disabled.bin") != 0 && strcmp(fno.fname, "DISABLED.BIN") != 0) {
+                                 
+                                 // We only delete one file per directory pass to be safe with FatFs
+                                 if (f_unlink(fno.fname) == FR_OK) {
+                                     deleted_count++;
+                                     deleted_in_pass++;
+                                     break; // Break the readdir loop, restart opendir
+                                 }
+                             }
+                         }
+                     }
+                     f_closedir(&dir);
+                 } else {
+                     break; // opendir failed
+                 }
+             } while (deleted_in_pass > 0);
+             
+             if (fr == FR_OK || deleted_count > 0) {
+                 char msg[64];
+                 snprintf(msg, sizeof(msg), "Clear Done: %d files", deleted_count);
+                 BP_SendResponse(BP_CMD_CLEAR_DATA, BP_RESP_OK, msg);
+             } else {
+                 BP_SendResponse(BP_CMD_CLEAR_DATA, BP_RESP_ERR, "Clear Failed");
+             }
+        }
+        else if (cmd == BP_CMD_GET_FILE) {
+             extern FIL SDFile;
+             FRESULT fr = f_open(&SDFile, g_pending_filename, FA_READ);
+             if (fr == FR_OK) {
+                 uint32_t total_size = f_size(&SDFile);
+                 uint32_t sent_bytes = 0;
+                 uint8_t read_buf[256]; // Chunk size
+                 UINT br;
+                 
+                 // Send Start Packet: CMD_RESP with size
+                 char start_msg[64];
+                 snprintf(start_msg, sizeof(start_msg), "SIZE:%lu", total_size);
+                 BP_SendResponse(BP_CMD_GET_FILE, BP_RESP_OK, start_msg);
+                 
+                 // Stream Data
+                 uint16_t seq = 0;
+                 while (sent_bytes < total_size) {
+                     fr = f_read(&SDFile, read_buf, sizeof(read_buf), &br);
+                     if (fr != FR_OK || br == 0) break;
+                     
+                     // Send Data Packet (Type = BP_TYPE_FILE = 0x20 used for OTA, maybe reuse or new type?)
+                     // Let's use BP_TYPE_CMD_RESP with a special status or just raw payload?
+                     // Better: Use a dedicated Type for File Data to avoid confusion.
+                     // Let's use BP_TYPE_OTA (0x20) as "File Transfer" type for now, or add BP_TYPE_FILE_DATA
+                     // Actually, host expects CMD_RESP for handshake, then raw data?
+                     // Let's pack it as BP_TYPE_CMD_RESP with a specific structure? No, overhead.
+                     // Use BP_TYPE_OTA (0x20) for generic file data.
+                     
+                     uint8_t tx_buf[300];
+                      uint16_t tx_len = BP_Pack(tx_buf, 0x20, seq++, read_buf, br); // 0x20 = OTA/File Type
+                      
+                      uint8_t res = CDC_Transmit_FS(tx_buf, tx_len);
+                      if (res == USBD_BUSY) {
+                          HAL_Delay(2); // Wait a bit
+                          res = CDC_Transmit_FS(tx_buf, tx_len);
+                      }
+                      
+                      sent_bytes += br;
+                     // Flow control delay?
+                     // HAL_Delay(1); 
+                 }
+                 f_close(&SDFile);
+                 
+                 // Send End Packet
+                 BP_SendResponse(BP_CMD_GET_FILE, BP_RESP_OK, "EOF");
+                 
+             } else {
+                  BP_SendResponse(BP_CMD_GET_FILE, BP_RESP_ERR, "Open Fail");
+              }
+         }
+         /* 
+         // ====== BINARY OTA LOGIC COMMENTED OUT TO PREVENT WHILE(1) HAZARDS ======
+         // The system currently relies on ASCII text-based OTA via updata_helper.
+         else if (cmd == BP_CMD_OTA_START) {
+             // Reuse existing logic, but adapt for binary
+             extern cmd_response_t cmd_ota_start_handler(char*);
+             char size_str[32];
+             snprintf(size_str, sizeof(size_str), "%lu", g_pending_ota_size);
+             cmd_ota_start_handler(size_str);
+             // Response sent by handler or we can send a dedicated one
+             BP_SendResponse(BP_CMD_OTA_START, BP_RESP_OK, "OTA Ready");
+         }
+         else if (cmd == BP_CMD_OTA_APPLY) {
+             extern volatile uint8_t g_ota_complete_flag;
+             extern uint32_t calculate_file_crc32(const char* filename); // Need to implement or use STM32 CRC
+             
+             if (g_ota_complete_flag) {
+                 // Verify CRC if provided
+                 if (g_pending_ota_crc != 0) {
+                     uint32_t calc_crc = calculate_file_crc32("update.bin");
+                     if (calc_crc != g_pending_ota_crc) {
+                         BP_SendResponse(BP_CMD_OTA_APPLY, BP_RESP_ERR, "CRC Mismatch! Aborting.");
+                         f_unlink("update.bin"); // Delete bad file
+                         continue; // Don't reset, skip to next loop iteration
+                     }
+                 }
+                 
+                 BP_SendResponse(BP_CMD_OTA_APPLY, BP_RESP_OK, "CRC OK. Shutting down...");
+                 HAL_Delay(500);
+                 
+                 // Play shutdown sound
+                 Wav_Play("AUDIO/2.wav");
+                 while(is_playing) {
+                     Wav_Process();
+                 }
+                 
+                 // Shutdown
+                 HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET);
+                 
+                 extern volatile uint8_t g_usb_host_connected;
+                 if (g_usb_host_connected == 1) {
+                      NVIC_SystemReset();
+                 } else {
+                      while(1);
+                 }
+             } else {
+                 BP_SendResponse(BP_CMD_OTA_APPLY, BP_RESP_ERR, "Transfer Incomplete");
+             }
+         }
+         // =========================================================================
+         */
+     }
+    
+    // --- Restored Logic from Original Main ---
+    // Handle Audio (if needed in loop context, though app_run_loop handles it)
+    extern void Wav_Process(void);
+    Wav_Process(); 
+    
+    // Handle Power Off Check
+    extern void Check_Power_Off(void);
+    Check_Power_Off(); // Important for hardware shutdown!
+
+    // 1Hz Loop for Housekeeping (Battery, IMU)
     if (HAL_GetTick() - last_qmi_print >= 1000) {
+        last_qmi_print = HAL_GetTick();
+
         // Read IMU
         QMI8658_Read_XYZ(acc, gyro);
-        
+
         // Read Battery
         Update_Battery_Voltage();
 
         // Check Low Battery (New)
         Low_Battery_Check();
-        
-        // Send Packet (Only if not in Stream mode, or maybe always? 
-        // Original code commented this out to avoid conflict.
-        // Let's keep Send_AUX_Packet commented out here if Stream mode handles it, 
-        // OR better yet, let Stream mode read the global variables.)
-        
-        // Send_AUX_Packet(acc, gyro, Battery_Voltage); 
-        
-        last_qmi_print = HAL_GetTick();
     }
+    
+    // Task Countdown Checking
+    extern volatile uint8_t g_task_state;
+    if (g_task_state == 1) { // TASK_STATE_PENDING
+        extern uint32_t g_task_start_tick;
+        extern uint32_t g_task_delay_ms;
+        if (HAL_GetTick() - g_task_start_tick >= g_task_delay_ms) {
+            g_task_state = 2; // TASK_STATE_RUNNING
+            extern uint32_t g_task_id;
+            char filename[32];
+            snprintf(filename, sizeof(filename), "T_%lu.BIN", g_task_id); // Change extension to .BIN
+            
+            extern volatile uint8_t g_use_binary_protocol;
+            g_use_binary_protocol = 1;
+            
+            // Re-use stream handler to start collection cleanly
+            extern cmd_response_t cmd_stream_handler(char*);
+            cmd_stream_handler(filename);
+            
+            // We can also send an async notification if we want, but it's optional.
+        }
+    }
+    
+    app_run_loop();
   }
   /* USER CODE END 3 */
+  
+  return 0; // Should never reach here
 }
 
 /**
@@ -790,7 +1098,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, G_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, POWER_CTRL_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, POWER_CTRL_Pin|GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : LED_1_Pin ADS1299_RESET_Pin ADS1299_START_Pin ADS1299_CS_Pin
                            G_CS_Pin */
@@ -802,11 +1110,11 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pins : POWER_CTRL_Pin */
-  GPIO_InitStruct.Pin = POWER_CTRL_Pin;
+  GPIO_InitStruct.Pin = POWER_CTRL_Pin|GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(POWER_CTRL_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : POWER_KEY_Pin */
   GPIO_InitStruct.Pin = POWER_KEY_Pin;
@@ -882,7 +1190,15 @@ void Check_Power_Off(void) {
                     
                     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
                     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET); // Unlatch Power (PA4 Low)
-                    while(1); // Wait for power cut
+                    
+                    extern volatile uint8_t g_usb_host_connected;
+                    if (g_usb_host_connected == 1) {
+                         NVIC_SystemReset();
+                    } else {
+											   HAL_Delay(2000);
+                         NVIC_SystemReset(); 
+											//while(1); // Wait for power cut
+                    }
                 }
             }
         }
@@ -939,7 +1255,23 @@ void Low_Battery_Check(void) {
             
             // Cut Power
             HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET);
-            while(1);
+            
+            // If USB is connected, it might provide power and prevent shutdown.
+            // Avoid getting trapped in while(1) in that case.
+            extern volatile uint8_t g_usb_host_connected;
+            if (g_usb_host_connected == 1) {
+                // If connected to USB, do not enter while(1). 
+                // Just reset low_batt_cnt so it can try again later or let the user know.
+                // Or soft reset. Soft reset is safer to clear states.
+                NVIC_SystemReset();
+            } else {
+                // If not connected to USB host, we still might be connected to a dumb charger.
+                // Instead of while(1) which causes freezing and heating, we perform a soft reset
+                // after a short delay if power hasn't been cut yet.
+                // This ensures the device either dies gracefully or reboots cleanly if externally powered.
+                HAL_Delay(2000); 
+                NVIC_SystemReset();
+            }
         }
     } else {
         low_batt_cnt = 0;
@@ -948,10 +1280,12 @@ void Low_Battery_Check(void) {
 
 void Send_AUX_Packet(float *acc, float *gyro, float vbat) {
     // Print AUX data as text
+    /*
     USB_Print("AUX:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n", 
               acc[0], acc[1], acc[2], 
               gyro[0], gyro[1], gyro[2], 
               vbat);
+    */
 }
 
 void USB_SendString(const char* str) {
@@ -972,6 +1306,12 @@ void USB_SendString(const char* str) {
 #include "usbd_cdc.h"
 
 void USB_Print(const char* format, ...) {
+    extern volatile uint8_t g_use_binary_protocol;
+    // 如果处于二进制协议模式，直接丢弃纯文本打印，防止阻塞主循环和干扰二进制数据流
+    if (g_use_binary_protocol) {
+        return;
+    }
+
     static char buffer[256]; // Use static buffer to ensure memory validity during DMA/Interrupt transfer
     
     USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
@@ -1012,9 +1352,11 @@ void Send_EEG_Packet(uint8_t *raw_27_bytes) {
     
     // Print as CSV text, matching reference project style
     // Add "EEG:" prefix to distinguish from AUX data
+    /*
     USB_Print("EEG:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n", 
         voltages[0], voltages[1], voltages[2], voltages[3],
         voltages[4], voltages[5], voltages[6], voltages[7]);
+    */
 }
 
 /**

@@ -99,6 +99,7 @@ extern volatile uint8_t usb_cmd_ready;
 extern volatile uint8_t g_rx_test_mode;
 extern volatile uint32_t g_rx_test_count;
 extern volatile uint8_t g_rx_test_last_byte;
+extern volatile uint8_t g_usb_host_connected;
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
