@@ -108,6 +108,9 @@ void Check_Power_Off(void);
 void Update_Battery_Voltage(void);
 void Low_Battery_Check(void);
 void Send_AUX_Packet(float *acc, float *gyro, float vbat);
+static void MX_IWDG_Init(void);
+void BackupReg_Write(uint32_t index, uint32_t value);
+uint32_t BackupReg_Read(uint32_t index);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -230,11 +233,7 @@ void User_Device_Init(void)
     USB_Print("[BOOT] Initializing SD Card...\r\n");
     SD_Init_Process(); 
 
-    // 5. AD5933 Impedance Converter Scan & Init
-    USB_Print("[BOOT] Initializing AD5933 on PB10/PB11 (Soft I2C)...\r\n");
-    AD5933_Init();
-
-    // 6. WM8978 Audio Codec Init
+    // 5. WM8978 Audio Codec Init
     USB_Print("[BOOT] Initializing WM8978...\r\n");
     if (WM8978_Init() == 0) {
         wm8978_initialized = 1;
@@ -333,20 +332,44 @@ int main(void)
   MX_FATFS_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  // 0. RGB LED 硬件引脚初始化
+  RGB_LED_Init();
+
   // 1. BSP Init (Power, Soft I2C)
   User_BSP_Init();
 
   // 2. Device Init (ADS1299, QMI8658, AD5933)
   User_Device_Init();
 
-  /* 
-   * Note: ADS1299 Auto-start and WM8978 test code were removed 
-   * during refactoring to keep main() clean.
-   * See User_Device_Init() for sensor details.
-   */
-
   // 3. App Init (CLI, Buffers)
   User_App_Init();
+
+  // 4. Hot-Start Task Recovery (Resume from reset)
+  if (BackupReg_Read(BKP_REG_MAGIC) == BKP_MAGIC_NUMBER) {
+      uint32_t last_state = BackupReg_Read(BKP_REG_TASK_STATE);
+      uint32_t last_id = BackupReg_Read(BKP_REG_TASK_ID);
+      
+      if (last_state == 2) { // 2 = RUNNING
+          extern volatile uint8_t g_task_state;
+          extern uint32_t g_task_id;
+          g_task_id = last_id;
+          g_task_state = 2; // Immediately set to running
+          
+          char filename[32];
+          snprintf(filename, sizeof(filename), "T_%lu.BIN", g_task_id);
+          
+          extern volatile uint8_t g_use_binary_protocol;
+          g_use_binary_protocol = 1;
+          
+          extern cmd_response_t cmd_stream_handler(char*);
+          cmd_stream_handler(filename); // Resume recording
+          USB_Print("[BOOT] Hot Start: Resuming Task %lu\r\n", g_task_id);
+      }
+  }
+
+  // 5. Start Watchdog (4.0s timeout)
+  MX_IWDG_Init();
+  USB_Print("[BOOT] Watchdog Enabled. System Ready.\r\n");
   
   // Check if device is disabled via SD card flag
   {
@@ -374,18 +397,16 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t led_blink_tick = 0;
+  
+  // 初始化默认状态：开机默认蓝灯中速闪烁
+  RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_SOLID_ON);
   
   while (1)
   {
     IWDG->KR = 0xAAAA; // Feed Dog
     
-    // Heartbeat LED: Blink every 1 second (500ms ON, 500ms OFF)
-//    if (HAL_GetTick() - led_blink_tick >= 500) 
-//		{
-//        HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
-//        led_blink_tick = HAL_GetTick();
-//    }
+    // --- 处理 RGB 三色灯的非阻塞状态机 ---
+    RGB_LED_Process();
     
     /* USER CODE END WHILE */
 
@@ -414,6 +435,80 @@ int main(void)
              g_use_binary_protocol = 1;
              extern cmd_response_t cmd_stream_handler(char*);
              cmd_stream_handler(NULL);
+        }
+        else if (cmd == BP_CMD_GET_STATE) {
+             // Construct Status Packet: DeviceType(1) QMI(1) SD(1) BAT(2) DeviceState(1) TaskID(4) Ver(N) + '\0' + SN(N)
+             uint8_t status_payload[64];
+             status_payload[0] = 1; // Device Type: 1 = 小神探 (XiaoShenTan), 0 = 健脑师 (JianNaoShi)
+             status_payload[1] = 1; // QMI OK
+             status_payload[2] = 1; // SD OK
+             uint16_t bat_mv = 415; // 4.15V (Mocked, should be replaced with real ADC read)
+             status_payload[3] = bat_mv & 0xFF;
+             status_payload[4] = (bat_mv >> 8) & 0xFF;
+             
+             extern volatile uint8_t g_task_state;
+             extern uint32_t g_task_id;
+             extern volatile uint8_t g_usb_host_connected;
+             
+             uint8_t dev_state = 0;
+             
+             // State Logic Evaluation
+             if (g_usb_host_connected == 0) {
+                 dev_state = 4; // 未连接 (闲置的小神探端口)
+             } 
+             else if (g_task_state == 1 || g_task_state == 2) {
+                 dev_state = 3; // 进行中 (包括任务倒计时和进行中)
+             } 
+             else if (g_task_state == 99) { // Assuming 99 is a special flag for "Disabled", or we handle 0x0C later
+                 dev_state = 5; // 已停用
+             } 
+             else {
+                 // Connected and Idle
+                 if (bat_mv >= 360) { // Assume >3.6V is >60% (just a rough mock threshold, adjust as needed)
+                     dev_state = 1; // 已就绪 (已连接，电量>60%)
+                 } else {
+                     dev_state = 2; // 电量低 (已连接，电量<60%)
+                 }
+             }
+             
+             status_payload[5] = dev_state;
+             memcpy(&status_payload[6], &g_task_id, 4);
+             
+             const char* ver = "T1.0.3";
+             const char* sn = "AIT2601X04567";
+             
+             int offset = 10;
+             strcpy((char*)&status_payload[offset], ver);
+             offset += strlen(ver) + 1; // Include null terminator separator
+             
+             strcpy((char*)&status_payload[offset], sn);
+             offset += strlen(sn); // No need for null terminator at the very end
+             
+             uint8_t tx_buf[128];
+             uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_STATUS, 0, status_payload, offset); // Note: Seq is 0 here since it's asynchronous
+             CDC_Transmit_FS(tx_buf, tx_len);
+             
+             // Audio Output Switching Logic based on PB3 Level Transition
+             uint8_t current_pb3 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3);
+             static uint8_t last_pb3_state = 0xFF; // Static to persist across calls
+              if (current_pb3 != last_pb3_state) {
+                  // Re-run full initialization sequence to ensure signal path is fully restored
+                  if (WM8978_Init() == 0) {
+                      WM8978_ADDA_Cfg(1, 0);      // Enable DAC, Disable ADC
+                      WM8978_Write_Reg(11, 0xFF); // Digital Volume Max
+                      WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
+                      WM8978_Output_Cfg(1, 0);    // Enable DAC Output
+                      
+                      if (current_pb3 == 0) { // Low = Speaker (Unplugged or Reversed logic)
+                           WM8978_HPvol_Set(0, 0);    // Mute Headphone
+                           WM8978_SPKvol_Set(63);     // Max Volume (0-63 range)
+                       } else { // High = Headphone (Plugged in or Reversed logic)
+                           WM8978_HPvol_Set(63, 63); // Max Volume (0-63 range)
+                           WM8978_SPKvol_Set(0);      // Mute Speaker
+                       }
+                  }
+                  last_pb3_state = current_pb3;
+              }
         }
         else if (cmd == BP_CMD_STOP_STREAM) {
              extern cmd_response_t cmd_stop_handler(char*);
@@ -591,6 +686,9 @@ int main(void)
                  // Stream Data
                  uint16_t seq = 0;
                  while (sent_bytes < total_size) {
+                     IWDG->KR = 0xAAAA; // Feed Dog to prevent watchdog reset during large file transfer
+                     RGB_LED_Process(); // Keep LED responsive during file transfer
+                     
                      fr = f_read(&SDFile, read_buf, sizeof(read_buf), &br);
                      if (fr != FR_OK || br == 0) break;
                      
@@ -624,57 +722,6 @@ int main(void)
                   BP_SendResponse(BP_CMD_GET_FILE, BP_RESP_ERR, "Open Fail");
               }
          }
-         /* 
-         // ====== BINARY OTA LOGIC COMMENTED OUT TO PREVENT WHILE(1) HAZARDS ======
-         // The system currently relies on ASCII text-based OTA via updata_helper.
-         else if (cmd == BP_CMD_OTA_START) {
-             // Reuse existing logic, but adapt for binary
-             extern cmd_response_t cmd_ota_start_handler(char*);
-             char size_str[32];
-             snprintf(size_str, sizeof(size_str), "%lu", g_pending_ota_size);
-             cmd_ota_start_handler(size_str);
-             // Response sent by handler or we can send a dedicated one
-             BP_SendResponse(BP_CMD_OTA_START, BP_RESP_OK, "OTA Ready");
-         }
-         else if (cmd == BP_CMD_OTA_APPLY) {
-             extern volatile uint8_t g_ota_complete_flag;
-             extern uint32_t calculate_file_crc32(const char* filename); // Need to implement or use STM32 CRC
-             
-             if (g_ota_complete_flag) {
-                 // Verify CRC if provided
-                 if (g_pending_ota_crc != 0) {
-                     uint32_t calc_crc = calculate_file_crc32("update.bin");
-                     if (calc_crc != g_pending_ota_crc) {
-                         BP_SendResponse(BP_CMD_OTA_APPLY, BP_RESP_ERR, "CRC Mismatch! Aborting.");
-                         f_unlink("update.bin"); // Delete bad file
-                         continue; // Don't reset, skip to next loop iteration
-                     }
-                 }
-                 
-                 BP_SendResponse(BP_CMD_OTA_APPLY, BP_RESP_OK, "CRC OK. Shutting down...");
-                 HAL_Delay(500);
-                 
-                 // Play shutdown sound
-                 Wav_Play("AUDIO/2.wav");
-                 while(is_playing) {
-                     Wav_Process();
-                 }
-                 
-                 // Shutdown
-                 HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET);
-                 
-                 extern volatile uint8_t g_usb_host_connected;
-                 if (g_usb_host_connected == 1) {
-                      NVIC_SystemReset();
-                 } else {
-                      while(1);
-                 }
-             } else {
-                 BP_SendResponse(BP_CMD_OTA_APPLY, BP_RESP_ERR, "Transfer Incomplete");
-             }
-         }
-         // =========================================================================
-         */
      }
     
     // --- Restored Logic from Original Main ---
@@ -707,7 +754,11 @@ int main(void)
         extern uint32_t g_task_delay_ms;
         if (HAL_GetTick() - g_task_start_tick >= g_task_delay_ms) {
             g_task_state = 2; // TASK_STATE_RUNNING
-            extern uint32_t g_task_id;
+            
+            // Sync Task State to Backup Register
+            BackupReg_Write(BKP_REG_TASK_STATE, 2);
+            BackupReg_Write(BKP_REG_TASK_ID, g_task_id);
+            
             char filename[32];
             snprintf(filename, sizeof(filename), "T_%lu.BIN", g_task_id); // Change extension to .BIN
             
@@ -726,7 +777,8 @@ int main(void)
   }
   /* USER CODE END 3 */
   
-  return 0; // Should never reach here
+  return 0; // Should never reach here 
+	
 }
 
 /**
@@ -1100,6 +1152,9 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, POWER_CTRL_Pin|GPIO_PIN_10, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10|GPIO_PIN_11, GPIO_PIN_RESET);
+
   /*Configure GPIO pins : LED_1_Pin ADS1299_RESET_Pin ADS1299_START_Pin ADS1299_CS_Pin
                            G_CS_Pin */
   GPIO_InitStruct.Pin = LED_1_Pin|ADS1299_RESET_Pin|ADS1299_START_Pin|ADS1299_CS_Pin
@@ -1129,18 +1184,17 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(ADS1299_DRDY_GPIO_Port, &GPIO_InitStruct);
 
-  /* SCL (PB10) 三轴IIC */
-  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  /* PB10/PB11: AD5933 I2C pins, now reconfigured as simple output pulled down */
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP; 
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH; // 
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* SDA (PB11) 三轴IIC */
-  GPIO_InitStruct.Pin = GPIO_PIN_11;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD; // 
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  /* Configure PB3 as Input (Disable JTAG JTDO, keep SWD) */
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL; // 根据外部电路可改为 GPIO_PULLUP/DOWN
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
@@ -1150,8 +1204,59 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+  * @brief  Write to RTC Backup Register (0-31)
+  */
+void BackupReg_Write(uint32_t index, uint32_t value) {
+    if (index > 31) return;
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+    *(__IO uint32_t *)(&(RTC->BKP0R) + index) = value;
+    HAL_PWR_DisableBkUpAccess();
+}
+
+/**
+  * @brief  Read from RTC Backup Register (0-31)
+  */
+uint32_t BackupReg_Read(uint32_t index) {
+    if (index > 31) return 0;
+    return *(__IO uint32_t *)(&(RTC->BKP0R) + index);
+}
+
+/**
+  * @brief  Initialize Independent Watchdog (IWDG)
+  * @note   Timeout = (64 * 2000) / 32kHz = 4.0s
+  */
+static void MX_IWDG_Init(void) {
+    // 1. Enable DBGMCU freeze during debug
+    __HAL_DBGMCU_FREEZE_IWDG();
+
+    // 2. Start IWDG first to ensure LSI is running
+    IWDG->KR = 0xCCCC; 
+
+    // 3. Configure IWDG
+    IWDG->KR = 0x5555;    // Unlock PR, RLR
+    IWDG->PR = 4;         // 64 Prescaler
+    IWDG->RLR = 2000;     // 4s timeout
+    
+    // 4. Wait for sync with timeout protection
+    uint32_t timeout = 0x10000;
+    while (IWDG->SR != 0 && --timeout); 
+    
+    IWDG->KR = 0xAAAA;    // Reload
+}
+
 void Power_Control_Init(void) {
-    // Check Power Key (PA1) - Active Low
+    // Hot-Start Check: If Magic Number exists in Backup Register, latch power immediately
+    if (BackupReg_Read(BKP_REG_MAGIC) == BKP_MAGIC_NUMBER) {
+        HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET);
+        USB_Print("[PWR] Hot Start Detected. Power Latch Restored.\r\n");
+        return;
+    }
+
+    // Normal Start: Check Power Key (PA1) - Active Low
     // Note: PA1 is configured as INPUT in MX_GPIO_Init
     
     if (HAL_GPIO_ReadPin(POWER_KEY_GPIO_Port, POWER_KEY_Pin) == GPIO_PIN_RESET) {
@@ -1163,6 +1268,9 @@ void Power_Control_Init(void) {
                     // Confirm press for 2 seconds -> Power ON
                     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_SET); // Latch Power (PA4 High)
                     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET); // LED On (Active Low) -> Moved to main loop for blinking
+                    
+                    // Mark as "Powered On" in Backup Register to allow Hot-Start recovery
+                    BackupReg_Write(BKP_REG_MAGIC, BKP_MAGIC_NUMBER);
                     return;
                 }
             }
@@ -1178,7 +1286,14 @@ void Check_Power_Off(void) {
         HAL_Delay(20); // 20ms debounce
         if (HAL_GPIO_ReadPin(POWER_KEY_GPIO_Port, POWER_KEY_Pin) == GPIO_PIN_RESET) {
             uint32_t press_start = HAL_GetTick();
+            
+            // 按下按键时，蓝灯0.25s快闪
+            RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_FLASH_FAST);
+            
             while (HAL_GPIO_ReadPin(POWER_KEY_GPIO_Port, POWER_KEY_Pin) == GPIO_PIN_RESET) {
+                // 在这里需要继续调用 RGB_LED_Process，否则 while 循环会阻塞灯的翻转
+                RGB_LED_Process();
+                
                 if (HAL_GetTick() - press_start >= 2000) {
                     // Confirm press for 2 seconds -> Power OFF
                     
@@ -1187,20 +1302,26 @@ void Check_Power_Off(void) {
                     while(is_playing) {
                         Wav_Process();
                     }
-                    
+//                    
                     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
+//                    
+                    // Clear Magic Number before manual power off
+                    BackupReg_Write(BKP_REG_MAGIC, 0);
+                    
                     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET); // Unlatch Power (PA4 Low)
                     
                     extern volatile uint8_t g_usb_host_connected;
                     if (g_usb_host_connected == 1) {
                          NVIC_SystemReset();
                     } else {
-											   HAL_Delay(2000);
+                         HAL_Delay(2000);
                          NVIC_SystemReset(); 
-											//while(1); // Wait for power cut
                     }
                 }
             }
+            
+            // 如果按键没有达到2秒就松开了，退出循环，取消闪烁，恢复为蓝色常亮
+            RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_SOLID_ON);
         }
     }
 }
@@ -1252,6 +1373,9 @@ void Low_Battery_Check(void) {
                 HAL_Delay(100);
             }
             HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
+            
+            // Clear Magic Number for low battery shutdown
+            BackupReg_Write(BKP_REG_MAGIC, 0);
             
             // Cut Power
             HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET);

@@ -216,6 +216,7 @@ void handle_file_transfer(uint8_t* buf, uint32_t len) {
 
 // Called from Main Loop
 void process_ota_data(void) {
+    IWDG->KR = 0xAAAA; // Feed Dog during SD writes
     if (!g_file_transfer_mode) return;
     
     // Check overflow
@@ -906,13 +907,14 @@ cmd_response_t cmd_stream_handler(char* args) {
     } 
 
     // 3. Configure Bias (RLD)
-    // Only enabled channels contribute to Bias generation IF Bias is enabled
+    // ONLY use CH6, CH7, CH8 for BIAS_SENSP (0xE0) to ensure RLD loop stability.
+    // Never dynamically switch BIAS channels to prevent analog step response and oscillation.
     if (g_cfg_bias_en) {
         // Enable BIAS amplifier (PD_BIAS=1, Bit 2 in CONFIG3)
         // 0xEC = 1110 1100 (PD_REFBUF=1, PD_BIAS=1, BIASREF_INT=1, PD_BIAS_LOFF=0, BIAS_LOFF_SENS=0, BIAS_STAT=0)
         ADS1299_Write_Reg(0x03, 0xEC); 
-        ADS1299_Write_Reg(0x0D, g_cfg_ch_mask); // Enable BIAS_SENSP for active channels
-        current_bias_sensp_mask = g_cfg_ch_mask; // Initialize tracking variable
+        ADS1299_Write_Reg(0x0D, 0xE0); // Enable BIAS_SENSP for CH6, CH7, CH8 only (1110 0000)
+        current_bias_sensp_mask = 0xE0; // Initialize tracking variable
     } else {
         // Disable BIAS amplifier (PD_BIAS=0)
         // 0xE8 = 1110 1000
@@ -982,6 +984,9 @@ cmd_response_t cmd_stream_handler(char* args) {
 
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
+
+    // 开始 stream 运行，蓝色1s闪烁 (慢闪)
+    RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_FLASH_SLOW);
 
     app_state = APP_STREAM_RUNNING;
     start_time = HAL_GetTick();
@@ -1054,10 +1059,11 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
     } 
 
     // 3. Configure Bias (RLD) - Initial Setup
+    // ONLY use CH6, CH7, CH8 for BIAS_SENSP (0xE0) to ensure RLD loop stability.
     if (g_cfg_bias_en) {
         ADS1299_Write_Reg(0x03, 0xEC); 
-        ADS1299_Write_Reg(0x0D, g_cfg_ch_mask); 
-        current_bias_sensp_mask = g_cfg_ch_mask; // Initialize tracking variable
+        ADS1299_Write_Reg(0x0D, 0xE0); // Enable BIAS_SENSP for CH6, CH7, CH8 only (1110 0000)
+        current_bias_sensp_mask = 0xE0; // Initialize tracking variable
     } else {
         ADS1299_Write_Reg(0x03, 0xE8);
         ADS1299_Write_Reg(0x0D, 0x00);
@@ -1125,6 +1131,9 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
 
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
+
+    // 开始 auto stream 运行，蓝色1s闪烁 (慢闪)
+    RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_FLASH_SLOW);
 
     app_state = APP_AUTO_STREAM_RUNNING;
     start_time = HAL_GetTick();
@@ -1324,8 +1333,15 @@ void app_run_loop(void) {
 
         app_state = APP_IDLE;
         
+        // 只要回到空闲状态，无论从哪个模式，都恢复蓝灯常亮
+        RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_SOLID_ON);
+        
         if (g_task_state == 2) { // RUNNING
             g_task_state = 3; // COMPLETED
+            
+            // Clear Task State in Backup Register
+            BackupReg_Write(BKP_REG_TASK_STATE, 0);
+            BackupReg_Write(BKP_REG_TASK_ID, 0);
         }
         
         // Play 4.wav after stopping collection
@@ -1513,7 +1529,18 @@ void app_run_loop(void) {
         uint8_t packet[27];
         // ADS1299 packet: 3 bytes status + 8 * 3 bytes data = 27 bytes
         while (circular_buffer_get_data_count(&ADS1299_circula_buffer) >= 27) {
-            circular_buffer_read(&ADS1299_circula_buffer, packet, 27);
+            // Frame Sync Check: peek at the first byte to verify it's the ADS1299 status header (0xC0)
+            uint8_t header_byte;
+            circular_buffer_pop(&ADS1299_circula_buffer, &header_byte);
+            
+            if ((header_byte & 0xF0) != 0xC0) {
+                // Misaligned frame detected! Drop this byte and continue searching for the 0xC0 header.
+                continue;
+            }
+            
+            // Valid header found. Put it in packet[0] and read the remaining 26 bytes.
+            packet[0] = header_byte;
+            circular_buffer_read(&ADS1299_circula_buffer, &packet[1], 26);
             
             static char line[256];
             int len = 0;
@@ -1828,28 +1855,16 @@ void app_run_loop(void) {
                 stream_bad_ch_history |= bad_channels;
                 
                 if (bad_channels != 0) {
-                     // Pause acquisition immediately to update registers
-                     ADS1299_Send_Cmd(ADS1299_SDATAC);
-                     HAL_Delay(1); 
+                     // [FIX] We no longer power down channels or modify BIAS on lead-off.
+                     // We just record the bad channels to history for status reporting.
+                     // The hardware continues to run all channels normally.
                      
-                     // Update BIAS Mask
-                     current_bias_sensp_mask &= ~bad_channels;
-                     ADS1299_Write_Reg(0x0D, current_bias_sensp_mask);
-                     
-                     // Power-Down the bad channels in hardware to save power and cut noise
-                     for(int i=0; i<8; i++) {
-                         if (bad_channels & (1 << i)) {
-                             uint8_t current_chnset;
-                             ADS1299_Read_Regs(0x05 + i, &current_chnset, 1);
-                             ADS1299_Write_Reg(0x05 + i, current_chnset | 0x80);
-                         }
-                     }
-
-                     // Resume acquisition
-                     ADS1299_Send_Cmd(ADS1299_RDATAC);
-
-                     USB_Print("[AUTO] Lead-off detected (Bad: 0x%02X). BIAS Updated and Powered Down. Resuming.\r\n", 
+                     // Optional: You could still print a warning here if needed, 
+                     // but to avoid flooding the console, we rely on the binary status bits.
+                     /*
+                     USB_Print("[AUTO] Lead-off detected (Bad: 0x%02X). Continuing acquisition.\r\n", 
                                bad_channels);
+                     */
                 }
                 
                 // --- AUX Data Handling (50Hz Sampling, 1Hz Output) for AUTO_STREAM mode ---
@@ -1967,42 +1982,17 @@ void app_run_loop(void) {
                 int32_t raw_vals[8];
                 
                 for(int i=0; i<8; i++) {
-                    // Check if current channel is in bad history
-                    if (stream_bad_ch_history & (1 << i)) {
-                        // Channel is bad, find the next healthy channel
-                        int healthy_idx = -1;
-                        int attempts = 0;
-                        int search_idx = (i + 1) % 8;
-                        
-                        while (attempts < 7) {
-                            if ((stream_bad_ch_history & (1 << search_idx)) == 0) {
-                                healthy_idx = search_idx;
-                                break;
-                            }
-                            search_idx = (search_idx + 1) % 8;
-                            attempts++;
-                        }
-                        
-                        if (healthy_idx != -1) {
-                            // Found a healthy channel, borrow its data
-                            int ch_offset = 3 + healthy_idx * 3;
-                            int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
-                            if (val & 0x800000) val |= 0xFF000000;
-                            raw_vals[i] = val;
-                            voltages[i] = (float)val * scale;
-                        } else {
-                            // Failsafe: All 8 channels are disconnected!
-                            raw_vals[i] = 0;
-                            voltages[i] = 0.0f;
-                        }
-                    } else {
-                        // Channel is healthy, parse normally
-                        int ch_offset = 3 + i * 3;
-                        int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
-                        if (val & 0x800000) val |= 0xFF000000;
-                        raw_vals[i] = val;
-                        voltages[i] = (float)val * scale;
-                    }
+                    // [FIX] Removed data cloning for lead-off channels.
+                    // We now parse the actual channel data regardless of its lead-off status.
+                    // If the electrode is off, the上位机 will see the real noise/railing, 
+                    // which is the medically correct behavior.
+                    
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    
+                    raw_vals[i] = val;
+                    voltages[i] = (float)val * scale;
                 }
                 
                 if (g_use_binary_protocol) {
@@ -2066,7 +2056,7 @@ void app_run_loop(void) {
                     frame.eeg_data[i] = raw_vals[i];
                 }
                 for(int k=0; k<3; k++) {
-                    frame.acc[k] = (int16_t)(g_latest_acc[k] * 1000.0f);
+                    frame.acc[k] = (int16_t)(g_latest_acc[k] * 1000.0f);//
                     frame.gyro[k] = (int16_t)(g_latest_gyro[k] * 10.0f);
                 }
                 frame.motion_state = g_latest_motion_state;
@@ -2079,6 +2069,9 @@ void app_run_loop(void) {
                 }
                 frame.checksum = chk;
                 
+                // [FIX] Commented out SD card write to prevent blocking the main loop
+                // which causes ADS1299 circular buffer overflow and frame misalignment
+                
                 UINT bw;
                 FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
                 if (fr == FR_OK && bw == sizeof(DataFrame_t)) {
@@ -2086,6 +2079,7 @@ void app_run_loop(void) {
                         f_sync(&SDFile);
                     }
                 }
+                
             } else if (app_state == APP_STREAM_RUNNING) {
                 // Check Lead-Off (P-Pole)
                 // Status Byte 0: 1100 + IN8P..IN5P (Bits 3-0)
@@ -2107,36 +2101,19 @@ void app_run_loop(void) {
                 uint8_t new_bad_channels = loff_statp & current_bias_sensp_mask;
                 
                 if (new_bad_channels != 0) {
-                     // Pause acquisition immediately to update registers
-                     ADS1299_Send_Cmd(ADS1299_SDATAC);
-                     HAL_Delay(1); 
+                     // [FIX] We no longer power down channels or modify BIAS on lead-off.
+                     // We just record the bad channels to history for status reporting.
+                     // The hardware continues to run all channels normally.
                      
-                     // Update BIAS Mask: Remove NEW bad channels
-                     current_bias_sensp_mask &= ~new_bad_channels;
-                     ADS1299_Write_Reg(0x0D, current_bias_sensp_mask);
-                     
-                     // Power-Down the bad channels in hardware to save power and cut noise
-                     for(int i=0; i<8; i++) {
-                         if (new_bad_channels & (1 << i)) {
-                             // Write to CHnSET register (0x05 + i)
-                             // Set bit 7 (PDn) to 1 to power down the channel
-                             uint8_t current_chnset;
-                             ADS1299_Read_Regs(0x05 + i, &current_chnset, 1);
-                             ADS1299_Write_Reg(0x05 + i, current_chnset | 0x80);
-                         }
-                     }
-
                      // Accumulate history
                      stream_bad_ch_history |= new_bad_channels;
                      
-                     // Resume acquisition
-                     ADS1299_Send_Cmd(ADS1299_RDATAC);
-
-                     // In binary mode, we rely on the packet[0..2] to report status
-                     // In ASCII mode, we can optionally print it
+                     // In ASCII mode, we can optionally print it (commented out to avoid flooding)
+                     /*
                      if (!g_use_binary_protocol) {
-                         USB_Print("[STREAM] Bad channels detected: 0x%02X. Removed from Bias and Powered Down.\r\n", new_bad_channels);
+                         USB_Print("[STREAM] Bad channels detected: 0x%02X. Continuing acquisition.\r\n", new_bad_channels);
                      }
+                     */
                 }
                 
                 float voltages[8];
@@ -2144,42 +2121,17 @@ void app_run_loop(void) {
                 
                 // Parse values with channel replacement logic for lead-off channels
                 for(int i=0; i<8; i++) {
-                    // Check if current channel is in bad history
-                    if (stream_bad_ch_history & (1 << i)) {
-                        // Channel is bad, find the next healthy channel
-                        int healthy_idx = -1;
-                        int attempts = 0;
-                        int search_idx = (i + 1) % 8;
-                        
-                        while (attempts < 7) {
-                            if ((stream_bad_ch_history & (1 << search_idx)) == 0) {
-                                healthy_idx = search_idx;
-                                break;
-                            }
-                            search_idx = (search_idx + 1) % 8;
-                            attempts++;
-                        }
-                        
-                        if (healthy_idx != -1) {
-                            // Found a healthy channel, borrow its data
-                            int ch_offset = 3 + healthy_idx * 3;
-                            int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
-                            if (val & 0x800000) val |= 0xFF000000;
-                            raw_vals[i] = val;
-                            voltages[i] = (float)val * scale;
-                        } else {
-                            // Failsafe: All 8 channels are disconnected!
-                            raw_vals[i] = 0;
-                            voltages[i] = 0.0f;
-                        }
-                    } else {
-                        // Channel is healthy, parse normally
-                        int ch_offset = 3 + i * 3;
-                        int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
-                        if (val & 0x800000) val |= 0xFF000000;
-                        raw_vals[i] = val;
-                        voltages[i] = (float)val * scale;
-                    }
+                    // [FIX] Removed data cloning for lead-off channels.
+                    // We now parse the actual channel data regardless of its lead-off status.
+                    // If the electrode is off, the上位机 will see the real noise/railing, 
+                    // which is the medically correct behavior.
+                    
+                    int ch_offset = 3 + i * 3;
+                    int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
+                    if (val & 0x800000) val |= 0xFF000000;
+                    
+                    raw_vals[i] = val;
+                    voltages[i] = (float)val * scale;
                 }
                 
                 // Format: EEG:SEQ:x,v1,v2,v3,v4,v5,v6,v7,v8\n
@@ -2265,6 +2217,8 @@ void app_run_loop(void) {
                 }
                 frame.checksum = chk;
                 
+                // Write to SD Card (Stream & Save Binary)
+                
                 UINT bw;
                 FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
                 if (fr != FR_OK || bw < sizeof(DataFrame_t)) {
@@ -2275,6 +2229,7 @@ void app_run_loop(void) {
                         f_sync(&SDFile);
                     }
                 }
+                
             } else {
                 // QUAD (8-channel) mode
                 DataFrame_t frame = {0};
@@ -2373,10 +2328,9 @@ cmd_response_t cmd_sweep_handler(char* args) {
         return response;
     }
 
-    USB_Print("[CMD] Starting AD5933 Sweep...\r\n");
-    AD5933_Sweep();
-    
-    strcpy(response.message, "OK: Sweep Completed");
+    // AD5933 is disabled in this hardware revision
+    response.success = 0;
+    strcpy(response.message, "ERR: AD5933 disabled");
     return response;
 }
 
@@ -2436,6 +2390,9 @@ cmd_response_t cmd_test_imp_handler(char* args) {
     // Start Acquisition
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
+
+    // 开始阻抗检测运行，蓝色0.5s闪烁 (中速闪烁)
+    RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_FLASH_MID);
 
     app_state = APP_IMP_TEST_RUNNING; 
     start_time = HAL_GetTick();
@@ -2512,6 +2469,9 @@ cmd_response_t cmd_test_imp_all_handler(char* args) {
     // Start Acquisition
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
+
+    // 开始阻抗检测运行，蓝色0.5s闪烁 (中速闪烁)
+    RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_FLASH_MID);
 
     app_state = APP_IMP_TEST_ALL_RUNNING; 
     start_time = HAL_GetTick();

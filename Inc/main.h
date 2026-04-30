@@ -31,7 +31,7 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "led.h"
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -55,6 +55,8 @@ void Error_Handler(void);
 /* USER CODE BEGIN EFP */
 void USB_Print(const char* format, ...);
 void USB_SendString(const char* str);
+void BackupReg_Write(uint32_t index, uint32_t value);
+uint32_t BackupReg_Read(uint32_t index);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
@@ -88,6 +90,11 @@ void USB_SendString(const char* str);
 #define POWER_CTRL_GPIO_Port GPIOA
 #define POWER_KEY_Pin GPIO_PIN_1
 #define POWER_KEY_GPIO_Port GPIOA
+
+#define BKP_MAGIC_NUMBER    0x55AA1234
+#define BKP_REG_MAGIC       0
+#define BKP_REG_TASK_STATE  1
+#define BKP_REG_TASK_ID     2
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

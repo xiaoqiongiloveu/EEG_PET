@@ -1,5 +1,6 @@
 /* command_system.c */
 #include "command_system.h"
+#include "main.h"
 #include "binary_protocol.h" // New Protocol
 #include "fatfs.h"
 #include <stdio.h>
@@ -43,6 +44,35 @@ uint32_t g_pending_ota_size = 0;
 uint32_t g_pending_ota_crc = 0;
 
 // Helper to send binary response
+void Write_Log_To_SD(const char* log_str) {
+    // [FIX] 直接返回，彻底禁止空闲状态下写入或创建 0 字节的 CMD_LOG.TXT 文件
+    return;
+    
+    // 1. 安全检查：只有空闲状态且 SD 卡挂载时才允许写日志
+    extern volatile uint8_t g_task_state;
+    extern uint8_t sd_mounted;
+    extern FIL SDFile;
+    
+    // 我们用 g_task_state == 0 来表示真正的空闲状态 (0=空闲, 1=倒计时, 2=采集中)
+    if (g_task_state != 0 || !sd_mounted) return;
+
+    // 2. 以“追加模式”打开日志文件
+    if (f_open(&SDFile, "CMD_LOG.TXT", FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
+        // 3. 写入带时间戳的日志
+        char timestamp_str[32];
+        int ts_len = snprintf(timestamp_str, sizeof(timestamp_str), "[%lu] ", HAL_GetTick());
+        
+        UINT bw;
+        // 暂时注释掉空闲状态下的SD卡日志写入
+        // f_write(&SDFile, timestamp_str, ts_len, &bw);
+        // f_write(&SDFile, log_str, strlen(log_str), &bw);
+        // f_write(&SDFile, "\r\n", 2, &bw);
+        
+        // 4. 关闭文件
+        f_close(&SDFile);
+    }
+}
+
 void BP_SendResponse(uint8_t cmd_id, uint8_t status, const char* msg) {
     uint8_t payload[64];
     payload[0] = cmd_id;
@@ -54,6 +84,12 @@ void BP_SendResponse(uint8_t cmd_id, uint8_t status, const char* msg) {
     uint8_t tx_buf[128];
     uint16_t len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, payload, 2 + msg_len);
     CDC_Transmit_FS(tx_buf, len);
+    
+    // ----- 记录二进制命令响应日志 -----
+    // char log_buf[128];
+    // snprintf(log_buf, sizeof(log_buf), "[BIN] RX_CMD: 0x%02X -> TX_ACK: %s (Status: %d)", cmd_id, msg ? msg : "NULL", status);
+    // Write_Log_To_SD(log_buf);
+    // ---------------------------------
 }
 
 // Callback from parser
@@ -116,6 +152,11 @@ void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* paylo
                              g_task_delay_ms = delay_min * 60000;
                              g_task_start_tick = HAL_GetTick();
                              g_task_state = 1; // PENDING
+                             
+                             // Sync Task State (1=Pending) to Backup Register
+                             BackupReg_Write(BKP_REG_TASK_STATE, 1);
+                             BackupReg_Write(BKP_REG_TASK_ID, g_task_id);
+                             
                              BP_SendResponse(cmd_id, BP_RESP_OK, "Task Scheduled");
                              break;
                          }
@@ -129,57 +170,8 @@ void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* paylo
 
             case BP_CMD_GET_STATE:
             {
-                // Construct Status Packet: DeviceType(1) QMI(1) SD(1) BAT(2) DeviceState(1) TaskID(4) Ver(N) + '\0' + SN(N)
-                uint8_t status_payload[64];
-                status_payload[0] = 1; // Device Type: 1 = 小神探 (XiaoShenTan), 0 = 健脑师 (JianNaoShi)
-                status_payload[1] = 1; // QMI OK
-                status_payload[2] = 1; // SD OK
-                uint16_t bat_mv = 415; // 4.15V (Mocked, should be replaced with real ADC read)
-                status_payload[3] = bat_mv & 0xFF;
-                status_payload[4] = (bat_mv >> 8) & 0xFF;
-                
-                extern volatile uint8_t g_task_state;
-                extern uint32_t g_task_id;
-                extern volatile uint8_t g_usb_host_connected;
-                
-                uint8_t dev_state = 0;
-                
-                // State Logic Evaluation
-                if (g_usb_host_connected == 0) {
-                    dev_state = 4; // 未连接 (闲置的小神探端口)
-                } 
-                else if (g_task_state == 1 || g_task_state == 2) {
-                    dev_state = 3; // 进行中 (包括任务倒计时和进行中)
-                } 
-                else if (g_task_state == 99) { // Assuming 99 is a special flag for "Disabled", or we handle 0x0C later
-                    dev_state = 5; // 已停用
-                } 
-                else {
-                    // Connected and Idle
-                    if (bat_mv >= 360) { // Assume >3.6V is >60% (just a rough mock threshold, adjust as needed)
-                        dev_state = 1; // 已就绪 (已连接，电量>60%)
-                    } else {
-                        dev_state = 2; // 电量低 (已连接，电量<60%)
-                    }
-                }
-                
-                status_payload[5] = dev_state;
-                memcpy(&status_payload[6], &g_task_id, 4);
-                
-                const char* ver = "T1.0.1";
-                const char* sn = "AIT2601X04566";
-                
-                int offset = 10;
-                strcpy((char*)&status_payload[offset], ver);
-                offset += strlen(ver) + 1; // Include null terminator separator
-                
-                strcpy((char*)&status_payload[offset], sn);
-                offset += strlen(sn); // No need for null terminator at the very end
-                
-                uint8_t tx_buf[128];
-                uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_STATUS, seq, status_payload, offset);
-                CDC_Transmit_FS(tx_buf, tx_len);
-                break;
+                 g_pending_binary_cmd = BP_CMD_GET_STATE;
+                 break;
             }
             
             case BP_CMD_START_STREAM:
@@ -195,6 +187,11 @@ void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* paylo
                          g_task_state = 0; // NONE
                          extern uint32_t g_task_id;
                          g_task_id = 0;
+                         
+                         // Clear Task State in Backup Register
+                         BackupReg_Write(BKP_REG_TASK_STATE, 0);
+                         BackupReg_Write(BKP_REG_TASK_ID, 0);
+                         
                          BP_SendResponse(cmd_id, BP_RESP_OK, "Pending Task Cancelled");
                          break;
                      }
@@ -444,6 +441,12 @@ cmd_response_t process_command_ex(char* input) {
     if (response.message[0] != '\0') {
         USB_Print("%s\r\n", response.message);
     }
+
+    // ----- 记录文本命令日志 -----
+    // char log_buf[128];
+    // snprintf(log_buf, sizeof(log_buf), "[TXT] RX: %s -> TX: %s", command_name, response.message);
+    // Write_Log_To_SD(log_buf);
+    // ----------------------------
 
     return response;
 }

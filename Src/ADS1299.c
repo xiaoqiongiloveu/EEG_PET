@@ -112,7 +112,7 @@ void ADS1299_Init(void)
     ADS1299_REG[0x0C] = 0x60;
 
     ADS1299_REG[0x0D] = 0xFF; // FF : all p to RLD bias
-    ADS1299_REG[0x0E] = 0x00; //
+    ADS1299_REG[0x0E] = 0xFF; // 0x00
     ADS1299_REG[0x0F] = 0x00; //
     ADS1299_REG[0x10] = 0x00; //
     ADS1299_REG[0x11] = 0x00; // Lead-Off Current Direction
@@ -199,7 +199,17 @@ void ADS1299_DRDY_Handler(void) {
     ADS1299_SPI_RW(rx, rx, 27); 
     ADS1299_CS_H;
     
-    for(int i=0; i<27; i++) {
-        circular_buffer_push(&ADS1299_circula_buffer, rx[i]);
+    // Ensure we only push if there is enough room for the FULL 27-byte packet.
+    // This prevents partial packet pushes which permanently destroy frame alignment.
+    uint32_t data_count = circular_buffer_get_data_count(&ADS1299_circula_buffer);
+    uint32_t free_space = ADS1299_circula_buffer.size - 1 - data_count;
+    
+    if (free_space >= 27) {
+        for(int i=0; i<27; i++) {
+            circular_buffer_push(&ADS1299_circula_buffer, rx[i]);
+        }
+    } else {
+        // Buffer overflow: drop the entire packet to maintain alignment
+        // (Optional: increment an overflow counter here)
     }
 }

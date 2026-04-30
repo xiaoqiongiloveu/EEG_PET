@@ -290,6 +290,7 @@ void Wav_Stop(void) {
 
 // Call this in main loop to handle buffer refilling
 void Wav_Process(void) {
+    IWDG->KR = 0xAAAA; // Feed Dog during audio processing
     if (!is_playing) return;
 	  
     // Handle Half Transfer (Refill First Half)
