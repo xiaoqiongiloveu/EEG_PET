@@ -74,5 +74,6 @@ extern uint8_t is_playing;
 uint8_t Wav_Play(const char* fname);
 void Wav_Stop(void);
 void Wav_Process(void);
+void Play_System_Audio(uint8_t audio_id);
 
 #endif

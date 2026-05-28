@@ -519,11 +519,6 @@
               <FilePath>..\Src\wavplay.c</FilePath>
             </File>
             <File>
-              <FileName>ad5933.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Src\ad5933.c</FilePath>
-            </File>
-            <File>
               <FileName>binary_protocol.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Src\binary_protocol.c</FilePath>

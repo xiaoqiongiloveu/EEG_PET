@@ -11,7 +11,6 @@
 #include "circular_buffer.h"
 #include "bsp_driver_sd.h"
 #include <string.h>
-#include "ad5933.h"
 #include <math.h>
 #include "wavplay.h"
 
@@ -31,6 +30,12 @@ typedef struct {
 
 #define DEAD_BAND 5.0f
 
+/**
+ * @brief 更新并获取当前的运动状态等级
+ * @param raw_score 原始的运动能量得分 (0-100)
+ * @retval motion_state_t 计算出的最终运动状态枚举值
+ * @note 内部实现了死区抑制、动态基线跟踪以及状态机的平滑切换
+ */
 static motion_state_t Motion_State_Update(float raw_score) 
 {
     static motion_state_machine_t sm = {MOTION_STABLE, 0};
@@ -74,40 +79,41 @@ extern uint8_t sd_mounted;
 extern USBD_HandleTypeDef hUsbDeviceFS;
 extern ADC_HandleTypeDef hadc1; // Extern ADC handle
 
-// External functions/variables from main.c
+// 外部函数/变量来自 main.c
 extern float Battery_Voltage;
 extern void Update_Battery_Voltage(void);
 extern uint8_t wm8978_initialized;
 
-// Global Configuration Variables
+// 全局配置变量
 uint8_t g_cfg_gain = 24;
 uint8_t g_cfg_ch_mask = 0xFF;
 int g_cfg_sps = 250;
-uint8_t g_cfg_input_type = 0; // 0=Normal, 1=Short, 5=TestSig
+uint8_t g_cfg_input_type = 0; // 0=正常, 1=短接, 5=测试信号
 uint8_t g_cfg_bias_en = 1;
-uint32_t g_cfg_duration_sec = 0; // 0 = Infinite
-uint8_t g_cfg_test_sig = 0; // 0=External, 1=Internal
+uint32_t g_cfg_duration_sec = 0; // 0 = 无限长
+uint8_t g_cfg_test_sig = 0; // 0=外部, 1=内部
 
-// OTA Global Variables
+// OTA 全局变量
 volatile uint8_t g_file_transfer_mode = 0;
 static uint32_t ota_total_bytes = 0;
 static uint32_t ota_received_bytes = 0;
 static FIL ota_fil;
 static uint32_t ota_start_tick = 0;
-volatile uint8_t stream_bad_ch_history = 0; // Moved to top-level scope for visibility
-volatile uint8_t g_ota_complete_flag = 0;   // Flag to signal main loop to finish OTA
+volatile uint8_t stream_bad_ch_history = 0; // 移至顶层作用域以提高可见性
+volatile uint8_t g_ota_complete_flag = 0;   // 标志位，通知主循环完成 OTA
 
-// Task Global Variables
-volatile uint8_t g_task_state = 0; // 0=NONE, 1=PENDING, 2=RUNNING, 3=COMPLETED
+// 任务全局变量
+volatile uint8_t g_task_state = 0; // 0=无, 1=等待中, 2=运行中, 3=已完成
+volatile uint8_t g_write_sd_enabled = 0; // 0=在线模式(不写SD), 1=离线模式(写入SD)
 uint32_t g_task_id = 0;
 uint32_t g_task_start_tick = 0;
 uint32_t g_task_delay_ms = 0;
 
-// Static Buffers for Binary Protocol (Prevent Stack Overflow)
+// 二进制协议静态缓冲区 (防止栈溢出)
 static uint8_t g_bp_tx_buf[256];
 static uint8_t g_bp_payload[128];
 
-// Define Binary File Header and Frame Structures
+// 定义二进制文件头和帧结构
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic_word;      // 0x45454721 ("EEG!")
@@ -135,7 +141,12 @@ typedef struct {
 } DataFrame_t;
 #pragma pack(pop)
 
-// Simple Soft CRC32 implementation (Poly 0x04C11DB7)
+/**
+ * @brief 简单的软件 CRC32 计算实现 (多项式 0x04C11DB7)
+ * @param data 指向待计算数据的指针
+ * @param len 数据的字节长度
+ * @retval uint32_t 计算出的 CRC32 校验值
+ */
 uint32_t soft_crc32(const uint8_t *data, size_t len) {
     uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < len; i++) {
@@ -150,6 +161,12 @@ uint32_t soft_crc32(const uint8_t *data, size_t len) {
     return crc;
 }
 
+/**
+ * @brief 计算存储在 SD 卡中的文件的 CRC32 校验值
+ * @param filename 待校验的文件名
+ * @retval uint32_t 计算出的文件 CRC32 校验值，若文件打开失败则返回 0
+ * @note 采用标准以太网 CRC32 算法，兼容 Python 的 zlib.crc32，不使用查表法以节省空间
+ */
 uint32_t calculate_file_crc32(const char* filename) {
     extern FIL SDFile;
     if (f_open(&SDFile, filename, FA_READ) != FR_OK) return 0;
@@ -158,18 +175,12 @@ uint32_t calculate_file_crc32(const char* filename) {
     uint8_t buf[512];
     UINT br;
     
-    // Using STM32 CRC logic but software for now to be safe
-    // Note: Standard CRC32 usually inits with 0xFFFFFFFF and inverts at end
-    // But STM32 Hardware CRC uses 0xFFFFFFFF init and NO inversion by default.
-    // Let's stick to standard Ethernet CRC32 for compatibility with Python zlib.crc32
-    // Python zlib.crc32 is standard.
-    // Let's implement standard CRC32 table-less for size
-    
+    // 使用标准的 CRC32 无表实现
     while (1) {
         f_read(&SDFile, buf, sizeof(buf), &br);
         if (br == 0) break;
         
-        // Update CRC
+        // 更新 CRC
         for (size_t i = 0; i < br; i++) {
             uint32_t byte = buf[i];
             crc = crc ^ byte;
@@ -183,43 +194,44 @@ uint32_t calculate_file_crc32(const char* filename) {
     return ~crc;
 }
 
-// OTA Buffer System (Decouple USB Interrupt from FatFS)
-#define OTA_BUFFER_SIZE 4096 // 4KB Buffer (Double Buffer Concept: Fill one, Write one?)
-// Actually a Ring Buffer is better.
-// Or just a simple "Ping-Pong" buffer.
-// Let's use a simple large buffer. USB packets are 64 bytes. 
-// If main loop is slow (SD write takes 10ms), USB might overflow if we don't buffer enough.
-// 4KB is enough for ~64 USB packets. At 1MB/s, 4KB fills in 4ms.
-// SD write of 4KB might take 10-20ms. So we might need flow control.
+// OTA 缓冲区系统 (将 USB 中断与 FatFS 文件系统解耦)
+#define OTA_BUFFER_SIZE 4096 // 4KB 环形缓冲区
 
 static uint8_t ota_rx_buffer[OTA_BUFFER_SIZE];
 static volatile uint16_t ota_buf_head = 0;
 static volatile uint16_t ota_buf_tail = 0;
 static volatile uint8_t ota_buf_overflow = 0;
 
-// Called from USB Interrupt (CDC_Receive_FS -> handle_file_transfer)
+/**
+ * @brief 处理文件传输接收 (由 USB 中断调用)
+ * @param buf 指向接收到的数据缓冲区的指针
+ * @param len 接收到的数据长度
+ * @note 此函数在 USB 接收中断(CDC_Receive_FS)中被调用，将数据快速推入环形缓冲区
+ */
 void handle_file_transfer(uint8_t* buf, uint32_t len) {
     if (!g_file_transfer_mode) return;
     
-    // Copy data to ring buffer
+    // 将数据复制到环形缓冲区
     for (uint32_t i = 0; i < len; i++) {
         uint16_t next_head = (ota_buf_head + 1) % OTA_BUFFER_SIZE;
         if (next_head != ota_buf_tail) {
             ota_rx_buffer[ota_buf_head] = buf[i];
             ota_buf_head = next_head;
         } else {
-            ota_buf_overflow = 1; // Buffer Full! Drop data :(
-            // Ideally we should NAK or flow control here.
+            ota_buf_overflow = 1; // 缓冲区已满！丢弃数据
         }
     }
 }
 
-// Called from Main Loop
+/**
+ * @brief 处理 OTA 接收到的数据并写入 SD 卡
+ * @note 在主循环中被轮询调用，负责将环形缓冲区中的数据落盘，以防长时间阻塞 USB 中断
+ */
 void process_ota_data(void) {
-    IWDG->KR = 0xAAAA; // Feed Dog during SD writes
+    IWDG->KR = 0xAAAA; // 在写入 SD 卡期间喂狗
     if (!g_file_transfer_mode) return;
     
-    // Check overflow
+    // 检查缓冲区是否溢出
     if (ota_buf_overflow) {
         g_file_transfer_mode = 0;
         f_close(&ota_fil);
@@ -227,22 +239,19 @@ void process_ota_data(void) {
         return;
     }
 
-    // Check if enough data to write (e.g., 512 bytes or whatever is available)
-    uint16_t head = ota_buf_head; // Snapshot
+    // 检查是否有足够的数据需要写入
+    uint16_t head = ota_buf_head; // 获取快照
     uint16_t tail = ota_buf_tail;
     
-    if (head == tail) return; // Empty
+    if (head == tail) return; // 缓冲区为空
     
-    // Calculate contiguous available data
+    // 计算连续可用的数据长度
     uint16_t count;
     if (head >= tail) {
         count = head - tail;
     } else {
-        count = OTA_BUFFER_SIZE - tail; // Read until end first
+        count = OTA_BUFFER_SIZE - tail; // 先读到缓冲区末尾
     }
-    
-    // Cap write size to 512 for efficiency (or larger)
-    // if (count > 512) count = 512; 
     
     UINT bw;
     FRESULT fr = f_write(&ota_fil, &ota_rx_buffer[tail], count, &bw);
@@ -254,26 +263,32 @@ void process_ota_data(void) {
         return;
     }
     
-    // Advance tail
+    // 推进尾指针
     ota_buf_tail = (tail + count) % OTA_BUFFER_SIZE;
     
     ota_received_bytes += bw;
     
-    // Check completion
+    // 检查传输是否完成
     if (ota_received_bytes >= ota_total_bytes) {
          g_file_transfer_mode = 0;
          g_ota_complete_flag = 1;
          
-         // Note: File closing and "Transfer Complete" message are handled 
-         // in app_run_loop() to prevent double-closing the file (FatFS Error 9).
+         // 注意：文件关闭和"传输完成"的消息会在 app_run_loop() 中处理，
+         // 以防止对文件句柄进行二次关闭 (FatFS Error 9)。
     } else {
-        // Send Text Progress every ~10% or 64KB to avoid spamming the host
+        // 每接收约 64KB 发送一次文本进度，避免向主机发送过多消息
         if (ota_received_bytes % 65536 == 0) {
             USB_Print("[PROG] %lu / %lu\r\n", ota_received_bytes, ota_total_bytes);
         }
     }
 }
 
+/**
+ * @brief 启动 OTA 升级传输
+ * @param args 包含 OTA 文件总大小的参数字符串 (字节数)
+ * @retval cmd_response_t 指令执行结果
+ * @note 准备接收固件文件，并在 SD 卡中创建 update.bin 准备落盘
+ */
 cmd_response_t cmd_ota_start_handler(char* args) {
     cmd_response_t response = {1, ""};
     
@@ -289,7 +304,7 @@ cmd_response_t cmd_ota_start_handler(char* args) {
         return response;
     }
     
-    // Parse size
+    // 解析文件大小
     uint32_t size = strtoul(args, NULL, 0);
     if (size == 0) {
         response.success = 0;
@@ -297,7 +312,7 @@ cmd_response_t cmd_ota_start_handler(char* args) {
         return response;
     }
     
-    // Open file
+    // 打开/创建更新文件
     FRESULT fr = f_open(&ota_fil, "update.bin", FA_CREATE_ALWAYS | FA_WRITE);
     if (fr != FR_OK) {
         response.success = 0;
@@ -305,14 +320,12 @@ cmd_response_t cmd_ota_start_handler(char* args) {
         return response;
     }
     
-    // Pre-allocate if possible? FatFS f_expand? Not standard.
-    // Just set variables
     ota_total_bytes = size;
     ota_received_bytes = 0;
     ota_start_tick = HAL_GetTick();
     g_file_transfer_mode = 1;
     
-    // Reset Ring Buffer
+    // 重置环形缓冲区
     ota_buf_head = 0;
     ota_buf_tail = 0;
     ota_buf_overflow = 0;
@@ -323,6 +336,12 @@ cmd_response_t cmd_ota_start_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 应用 OTA 升级固件
+ * @param args 无需参数
+ * @retval cmd_response_t 指令执行结果
+ * @note 检查 update.bin 的有效性并重启系统，将控制权交由 Bootloader 进行固件替换
+ */
 cmd_response_t cmd_ota_apply_handler(char* args) {
     cmd_response_t response = {1, ""};
     (void)args;
@@ -341,19 +360,16 @@ cmd_response_t cmd_ota_apply_handler(char* args) {
     }
     
     USB_Print("[OTA] update.bin found (%lu bytes). Shutting down for update...\r\n", fno_info.fsize);
-    HAL_Delay(500); // Wait for message to be sent
+    HAL_Delay(500); // 等待消息发送完毕
     
-    // Play shutdown sound to indicate OTA ready
-    Wav_Play("AUDIO/2.wav");
-    while(is_playing) {
-        Wav_Process();
-    }
+    // 播放关机音效以指示 OTA 准备就绪 (使用 DEVICE_SHUTDOWN ID: 14)
+    Play_System_Audio(14);
     
-    // Perform Shutdown Sequence (Matches old project behavior)
-    // Pull POWER_CTRL Low (PA4)
+    // 执行关机/复位序列 (兼容旧项目行为)
+    // 拉低 POWER_CTRL (PA4) 以切断电源
     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET);
     
-    // Wait for power cut
+    // 等待断电或重启
     extern volatile uint8_t g_usb_host_connected;
     if (g_usb_host_connected == 1) {
          NVIC_SystemReset();
@@ -361,12 +377,12 @@ cmd_response_t cmd_ota_apply_handler(char* args) {
          while(1);
     }
     
-    // Should not reach here
+    // 正常情况下不会执行到这里
     strcpy(response.message, "OK: Shutting down...");
     return response;
 }
 
-// Local file system objects
+// 局部文件系统对象
 static DIR dir;
 static FILINFO fno;
 
@@ -381,47 +397,51 @@ static int current_sps = 250;
 static int current_channel = 1;
 static uint32_t stream_seq_num = 0;
 
-// Impedance Calculation Variables
+// 阻抗计算变量
 static float imp_max_val = -1e9;
 static float imp_min_val = 1e9;
 static int imp_window_count = 0;
-static const int IMP_WINDOW_SIZE = 50; // 0.2s @ 250Hz (approx 1.5 cycles of 7.8Hz)
+static const int IMP_WINDOW_SIZE = 50; // 0.2s @ 250Hz (约 1.5 个 7.8Hz 周期)
 
-// Noise Test Variables
+// 噪声测试变量
 static double noise_sum[8];
 static double noise_sum_sq[8];
 static float noise_min[8];
 static float noise_max[8];
 
-// CMRR Test Variables
+// CMRR 测试变量
 static double cmrr_sum_sq[8];
-static const float CMRR_VIN_RMS = 0.7071f; // Assuming 2Vpp input = 0.7071 Vrms
+static const float CMRR_VIN_RMS = 0.7071f; // 假设 2Vpp 输入 = 0.7071 Vrms
 
-// CMRR Full Test Variables
-static double cmrr_step1_sum_sq[8]; // For Differential Gain
-static double cmrr_step2_sum_sq[8]; // For Common Mode Gain
-static double cmrr_diff_gain[8];    // Calculated Differential Gain
+// CMRR 完整测试变量
+static double cmrr_step1_sum_sq[8]; // 用于差模增益
+static double cmrr_step2_sum_sq[8]; // 用于共模增益
+static double cmrr_diff_gain[8];    // 计算出的差模增益
 
-// Impedance Test Statistics
+// 阻抗测试统计
 static double imp_sum = 0.0;
 static uint32_t imp_count = 0;
 
 static double rld_sum[8];
 static double rld_sum_sq[8];
 
-// Impedance Test All Channels
+// 全通道阻抗测试变量
 static float imp_all_max[8];
 static float imp_all_min[8];
 
-// --- Global Configuration for STREAM ---
-// static uint8_t g_cfg_ch_mask = 0xFF; // Moved to global
-// static uint8_t g_cfg_gain = 24;      // Moved to global
-// static int     g_cfg_sps = 250;      // Moved to global
-// static uint8_t g_cfg_input_type = 0; // Moved to global
-// static uint8_t g_cfg_bias_en = 1;    // Moved to global
-static uint8_t current_bias_sensp_mask = 0; // Runtime BIAS mask for AUTO_STREAM
+// --- STREAM 全局配置 ---
+// static uint8_t g_cfg_ch_mask = 0xFF; // 已移至全局
+// static uint8_t g_cfg_gain = 24;      // 已移至全局
+// static int     g_cfg_sps = 250;      // 已移至全局
+// static uint8_t g_cfg_input_type = 0; // 已移至全局
+// static uint8_t g_cfg_bias_en = 1;    // 已移至全局
+static uint8_t current_bias_sensp_mask = 0; // AUTO_STREAM 运行时 BIAS 掩码
 
-/* Helper to convert Gain value to Register Bits */
+/**
+ * @brief 将增益倍数转换为 ADS1299 寄存器对应的配置位
+ * @param gain 设定的增益倍数 (1, 2, 4, 6, 8, 12, 24)
+ * @retval uint8_t 对应寄存器的位掩码 (默认返回 24 倍增益)
+ */
 static uint8_t get_gain_code(uint8_t gain) {
     switch(gain) {
         case 1:  return 0x00;
@@ -431,11 +451,15 @@ static uint8_t get_gain_code(uint8_t gain) {
         case 8:  return 0x40;
         case 12: return 0x50; 
         case 24: return 0x60; 
-        default: return 0x60; // Default to 24
+        default: return 0x60; // 默认使用 24 倍增益
     }
 }
 
-/* Helper to check text file */
+/**
+ * @brief 检查文件名是否以 .txt 结尾
+ * @param filename 待检查的文件名
+ * @retval int 如果是 .txt 文件返回 1，否则返回 0
+ */
 static int is_txt_file(const char* filename) {
   if (filename == NULL) return 0;
   int len = strlen(filename);
@@ -450,7 +474,11 @@ static int is_txt_file(const char* filename) {
   return 0;
 }
 
-/* Helper to display progress */
+/**
+ * @brief 打印文件处理或传输的进度信息
+ * @param current 当前已处理的字节数
+ * @param total 文件的总字节数
+ */
 static void display_file_progress(uint32_t current, uint32_t total) {
   if (total > 0) {
     float percent = (current * 100.0f) / total;
@@ -461,6 +489,11 @@ static void display_file_progress(uint32_t current, uint32_t total) {
   }
 }
 
+/**
+ * @brief 阻塞等待 USB 传输通道变为空闲状态
+ * @param timeout_ms 最大超时时间 (毫秒)
+ * @retval int 如果在超时前变为空闲返回 1，如果超时返回 0
+ */
 static int usb_wait_tx_idle(uint32_t timeout_ms) {
   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
   if (hcdc == NULL) return 0;
@@ -471,7 +504,10 @@ static int usb_wait_tx_idle(uint32_t timeout_ms) {
   return 1;
 }
 
-/* Helper for checking filesystem */
+/**
+ * @brief 检查并打印 SD 卡文件系统的容量与使用情况
+ * @note 内部调用 FatFs API 获取总容量与剩余空间并打印到串口
+ */
 static void check_filesystem_impl(void) {
   DWORD free_clust, free_size, total_size;
   FATFS *fs_ptr;
@@ -509,6 +545,11 @@ static void check_filesystem_impl(void) {
   }
 }
 
+/**
+ * @brief 处理 LIST 指令，列出 SD 卡根目录下的所有文本文件
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_list_handler(char* args) {
   cmd_response_t response = {1, ""};
   FRESULT fr;
@@ -540,6 +581,11 @@ cmd_response_t cmd_list_handler(char* args) {
   return response;
 }
 
+/**
+ * @brief 处理 GET 指令，从 SD 卡读取并传输指定文件到上位机
+ * @param args 包含要读取的目标文件名的参数字符串
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_get_handler(char* args) {
   cmd_response_t response = {1, ""};
   
@@ -642,16 +688,22 @@ cmd_response_t cmd_get_handler(char* args) {
   return response;
 }
 
+/**
+ * @brief 处理 DIAG 指令，进行 SD 卡及文件系统的深度诊断
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 打印物理连接状态、挂载状态、容量信息及所有文件详情
+ */
 cmd_response_t cmd_diag_handler(char* args) {
   cmd_response_t response = {1, ""};
   (void)args;
   USB_SendString("\r\n=== SD Card Diagnosis ===\r\n");
 
-  // 1. Check Physical Presence
+  // 1. 检查 SD 卡物理是否存在
   uint8_t is_detected = BSP_SD_IsDetected();
   USB_Print("SD Card Physical Status: %s\r\n", is_detected == SD_PRESENT ? "DETECTED" : "NOT DETECTED");
 
-  // 2. Check Mount Flag
+  // 2. 检查文件系统挂载标志
   USB_Print("File System Mount Flag: %s\r\n", sd_mounted ? "MOUNTED" : "NOT MOUNTED");
 
   if (is_detected != SD_PRESENT) {
@@ -660,7 +712,7 @@ cmd_response_t cmd_diag_handler(char* args) {
       return response;
   }
 
-  // 3. Try to mount if not mounted
+  // 3. 如果未挂载，尝试重新挂载
   if (!sd_mounted) {
       USB_SendString("Warning: FS not mounted. Attempting to mount...\r\n");
       FRESULT res = f_mount(&SDFatFS, SDPath, 1);
@@ -701,6 +753,11 @@ cmd_response_t cmd_diag_handler(char* args) {
   return response;
 }
 
+/**
+ * @brief 处理 HELP 指令，打印所有已注册指令的帮助信息
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_help_handler(char* args) {
   cmd_response_t response = {1, ""};
   print_all_commands();
@@ -708,6 +765,11 @@ cmd_response_t cmd_help_handler(char* args) {
   return response;
 }
 
+/**
+ * @brief 处理 DELETE 指令，从 SD 卡中删除指定文件
+ * @param args 包含要删除的目标文件名的参数字符串
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_delete_handler(char* args) {
   cmd_response_t response = {1, ""};
   
@@ -733,6 +795,11 @@ cmd_response_t cmd_delete_handler(char* args) {
   return response;
 }
 
+/**
+ * @brief 处理 INFO 指令，获取并打印指定文件的详细信息 (大小、日期、时间)
+ * @param args 包含要查询的目标文件名的参数字符串
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_info_handler(char* args) {
   cmd_response_t response = {1, ""};
   if (args == NULL || args[0] == '\0') {
@@ -756,10 +823,15 @@ cmd_response_t cmd_info_handler(char* args) {
   return response;
 }
 
+/**
+ * @brief 处理 CREATELARGE 指令，生成用于测试 SD 卡写入速度的 10MB 伪随机大文件
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_createlarge_handler(char* args) {
   cmd_response_t response = {1, ""};
   (void)args;
-  const UINT BUF_SIZE = 16384; // 16KB Buffer for faster write
+  const UINT BUF_SIZE = 16384; // 16KB 缓冲区以加速写入
   static uint8_t buffer[16384] __attribute__((aligned(4)));
   FRESULT fr;
   UINT bw;
@@ -770,7 +842,7 @@ cmd_response_t cmd_createlarge_handler(char* args) {
   uint32_t pat_state = 0;
   uint32_t start_ms = 0;
 
-  // Pre-fill buffer to save CPU time during write loop
+  // 预填充缓冲区，以节省在写入循环中的 CPU 时间
   for (UINT i = 0; i < BUF_SIZE; i++) {
     if (pat_state < 26) {
       buffer[i] = (uint8_t)('A' + pat_state);
@@ -825,10 +897,13 @@ cmd_response_t cmd_createlarge_handler(char* args) {
   return response;
 }
 
-/* ADS1299 Command Implementations */
+/* === ADS1299 相关指令处理实现 === */
 
-    // Deleted cmd_single_handler
-
+/**
+ * @brief 处理 STREAM 指令，以文本模式启动脑电数据采集
+ * @param args 包含目标文件名或采集参数的字符串
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_stream_handler(char* args) {
     cmd_response_t response = {1, ""};
     if (app_state != APP_IDLE) {
@@ -837,44 +912,45 @@ cmd_response_t cmd_stream_handler(char* args) {
         return response;
     }
 
-    // Determine filename
+    // 解析目标文件名
     char filename[64];
     if (args != NULL && args[0] != '\0') {
-        // Trim leading spaces and colon
+        // 过滤掉前导空格和冒号
         while(*args == ' ' || *args == ':') args++;
         
-        // Use user provided filename
+        // 使用用户指定的文件名，限制长度
         if (strlen(args) > 50) { 
              args[50] = '\0';
         }
         
-        // Check for extension
+        // 检查是否自带后缀名
         if (strstr(args, ".") == NULL) {
             snprintf(filename, sizeof(filename), "%s.BIN", args);
         } else {
             snprintf(filename, sizeof(filename), "%s", args);
         }
+        g_write_sd_enabled = 1; // 离线任务模式：启用 SD 卡写入
     } else {
         strcpy(filename, "EEG_DATA.BIN");
+        g_write_sd_enabled = 0; // 在线实时模式：禁用 SD 卡写入
     }
 
-    // Use Global Configuration for SPS and Duration
+    // 使用全局配置参数
     current_sps = g_cfg_sps;
     
-    // Calculate Target Samples based on Global Config Duration
+    // 计算目标采样总数
     if (g_cfg_duration_sec > 0) {
         target_samples = g_cfg_duration_sec * g_cfg_sps;
     } else {
-        target_samples = 0xFFFFFFFF; // Infinite (approx 200 days at 250sps)
+        target_samples = 0xFFFFFFFF; // 无限采集模式 (250SPS 下约 200 天)
     }
 
-    // Configure ADS1299
-    // Use Global Config from CONF command (g_cfg_sps, g_cfg_gain, g_cfg_ch_mask)
-    // NOTE: STREAM command does NOT reset these values. Use CONF command to change them.
+    // 配置 ADS1299 硬件寄存器
+    // 注意：STREAM 指令不重置全局配置，如果需要修改，应通过 CONF 指令
     ADS1299_Stop();
     
-    // 1. Set Sample Rate
-    uint8_t sps_code = 0x06; // Default 250
+    // 1. 设置采样率 (SPS)
+    uint8_t sps_code = 0x06; // 默认为 250 SPS
     if (g_cfg_sps == 250) sps_code = 0x06;
     else if (g_cfg_sps == 500) sps_code = 0x05;
     else if (g_cfg_sps == 1000) sps_code = 0x04;
@@ -885,60 +961,55 @@ cmd_response_t cmd_stream_handler(char* args) {
 
     ADS1299_Set_Sample_Parameter(sps_code, 6, 0); 
     
-    // 1.5. Configure CONFIG2 (0x02) for Test Signal if needed
+    // 1.5. 如果需要，配置 CONFIG2 开启测试信号发生器
     if (g_cfg_test_sig == 1 || g_cfg_input_type == 5) {
-        // 0xD0: INT_TEST=1 (Internal test signal), TEST_AMP=0 (1x), TEST_FREQ=00 (fCLK / 2^21)
+        // 0xD0: 开启内部测试信号发生器
         ADS1299_Write_Reg(0x02, 0xD0); 
     } else {
-        // 0xC0: External Test Signal
+        // 0xC0: 外部正常输入
         ADS1299_Write_Reg(0x02, 0xC0); 
     }
 
-    // 2. Set Channels and Gain
+    // 2. 配置通道的增益和输入模式
     uint8_t gain_bits = get_gain_code(g_cfg_gain);
     
-    // Enable configured channels 
     for(int i=1; i<=8; i++) { 
        if (g_cfg_ch_mask & (1 << (i-1))) {
-           ADS1299_Write_Reg(0x04 + i, gain_bits | (g_cfg_input_type & 0x07)); // Use global input type
+           ADS1299_Write_Reg(0x04 + i, gain_bits | (g_cfg_input_type & 0x07));
        } else {
-           ADS1299_Write_Reg(0x04 + i, 0x80 | 0x01); // Power Down + Input Shorted
+           ADS1299_Write_Reg(0x04 + i, 0x80 | 0x01); // 通道关断并短接输入
        }
     } 
 
-    // 3. Configure Bias (RLD)
-    // ONLY use CH6, CH7, CH8 for BIAS_SENSP (0xE0) to ensure RLD loop stability.
-    // Never dynamically switch BIAS channels to prevent analog step response and oscillation.
+    // 3. 配置右腿驱动偏置网络 (RLD BIAS)
+    // 强烈建议只使用 CH6, CH7, CH8 参与偏置网络以保证模拟环路稳定
+    // 切勿动态切换偏置通道，以防止模拟阶跃响应和振荡
     if (g_cfg_bias_en) {
-        // Enable BIAS amplifier (PD_BIAS=1, Bit 2 in CONFIG3)
-        // 0xEC = 1110 1100 (PD_REFBUF=1, PD_BIAS=1, BIASREF_INT=1, PD_BIAS_LOFF=0, BIAS_LOFF_SENS=0, BIAS_STAT=0)
+        // 开启 BIAS 放大器 (0xEC = 1110 1100)
         ADS1299_Write_Reg(0x03, 0xEC); 
-        ADS1299_Write_Reg(0x0D, 0xE0); // Enable BIAS_SENSP for CH6, CH7, CH8 only (1110 0000)
-        current_bias_sensp_mask = 0xE0; // Initialize tracking variable
+        ADS1299_Write_Reg(0x0D, 0xE0); // 仅启用 CH6, CH7, CH8 的 BIAS_SENSP (1110 0000)
+        current_bias_sensp_mask = 0xE0; // 初始化运行时掩码记录
     } else {
-        // Disable BIAS amplifier (PD_BIAS=0)
-        // 0xE8 = 1110 1000
+        // 关闭 BIAS 放大器 (0xE8 = 1110 1000)
         ADS1299_Write_Reg(0x03, 0xE8);
-        ADS1299_Write_Reg(0x0D, 0x00);          // Disable BIAS_SENSP for all channels
+        ADS1299_Write_Reg(0x0D, 0x00);
         current_bias_sensp_mask = 0x00;
     } 
     
-    // 4. Configure Lead-Off Detection (P-pole only as requested)
-    // We enable this for STREAM mode to allow real-time lead-off status and bad channel removal
-    
-    // CONFIG4 (0x17): Enable Lead-Off Comparator (Bit 1)
-    ADS1299_Write_Reg(0x17, 0x02); // PD_LOFF_COMP = 1
+    // 4. 配置导联脱落检测 (仅启用正极 P-pole)
+    // 开启比较器以便在数据流模式下实时获取脱落状态
+    ADS1299_Write_Reg(0x17, 0x02); // 开启 PD_LOFF_COMP
 
-    // LOFF (0x04): DC Lead-off, 6nA (Bits: 000 0 00 00) => 0x00
+    // LOFF (0x04): 直流脱落检测, 6nA (Bits: 000 0 00 00) => 0x00
     ADS1299_Write_Reg(0x04, 0x00); 
 
-    // LOFF_SENSP (0x0F): Enable P-side LOFF for active channels
+    // LOFF_SENSP (0x0F): 为活动的通道启用正极脱落检测
     ADS1299_Write_Reg(0x0F, g_cfg_ch_mask); 
 
-    // LOFF_SENSN (0x10): Disable N-side LOFF (0x00)
+    // LOFF_SENSN (0x10): 禁用负极脱落检测 (0x00)
     ADS1299_Write_Reg(0x10, 0x00);
     
-    // LOFF_FLIP (0x11): Disable current direction flip
+    // LOFF_FLIP (0x11): 禁用电流方向翻转
     ADS1299_Write_Reg(0x11, 0x00);
    
     USB_Print("\r\n[BOOT] ADS1299 Registers before START:\r\n"); 
@@ -949,38 +1020,37 @@ cmd_response_t cmd_stream_handler(char* args) {
        HAL_Delay(5); 
     } 
     
-    // Play 3.wav before starting collection
-    // Since we are now in the main loop context (deferred execution),
-    // it is safe to call Wav_Play.
-    Wav_Play("AUDIO/3.wav");
-    while(is_playing) {
-        Wav_Process();
+    // 在开始采集前播放 7.wav (COLLECT_START)
+    // 由于现在处于主循环上下文中 (延迟执行)，
+    // 调用 Play_System_Audio 是安全的。
+    Play_System_Audio(7);
+    
+    if (g_write_sd_enabled) {
+        // 打开用于记录的文件 (边流式传输边保存)
+        FRESULT fr = f_open(&SDFile, filename, FA_CREATE_ALWAYS | FA_WRITE);
+        if (fr != FR_OK) {
+            response.success = 0;
+            sprintf(response.message, "ERR: Failed to open %s (%d)", filename, fr);
+            return response;
+        }
+        
+        // 写入二进制文件头
+        FileHeader_t header = {0};
+        header.magic_word = 0x45454721; // "EEG!"
+        header.version = 0x0100;
+        header.header_length = sizeof(FileHeader_t); // Should be 256
+        header.sample_rate = current_sps;
+        header.num_channels = 8;
+        header.has_imu = 1;
+        header.has_motion = 1;
+        header.data_format = 0; // INT32
+        header.resolution_uv = 1000;
+        strcpy(header.device_name, "EEG_Device");
+        strcpy(header.fw_version, "V1.0");
+        
+        UINT bw;
+        f_write(&SDFile, &header, sizeof(FileHeader_t), &bw);
     }
-    
-    // Open file for recording (Stream & Save)
-    FRESULT fr = f_open(&SDFile, filename, FA_CREATE_ALWAYS | FA_WRITE);
-    if (fr != FR_OK) {
-        response.success = 0;
-        sprintf(response.message, "ERR: Failed to open %s (%d)", filename, fr);
-        return response;
-    }
-    
-    // Write Binary Header
-    FileHeader_t header = {0};
-    header.magic_word = 0x45454721; // "EEG!"
-    header.version = 0x0100;
-    header.header_length = sizeof(FileHeader_t); // Should be 256
-    header.sample_rate = current_sps;
-    header.num_channels = 8;
-    header.has_imu = 1;
-    header.has_motion = 1;
-    header.data_format = 0; // INT32
-    header.resolution_uv = 1000;
-    strcpy(header.device_name, "EEG_Device");
-    strcpy(header.fw_version, "V1.0");
-    
-    UINT bw;
-    f_write(&SDFile, &header, sizeof(FileHeader_t), &bw);
 
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
@@ -995,8 +1065,8 @@ cmd_response_t cmd_stream_handler(char* args) {
     last_save_time = start_time;
     last_display_time = start_time;
     
-    // Clear bad channel history
-    // extern uint8_t stream_bad_ch_history; // Removed redeclaration
+    // 清除坏道历史记录
+    // extern uint8_t stream_bad_ch_history; // 移除了重复声明
     stream_bad_ch_history = 0;
 
     sprintf(response.message, "OK: STREAM started. File:%s (Mask=0x%02X, Gain=%d, SPS=%d)", 
@@ -1004,6 +1074,11 @@ cmd_response_t cmd_stream_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 AUTO_STREAM 指令，启动带阻抗与脱落检测的自动脑电采集任务
+ * @param args 包含目标文件名的参数字符串
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_auto_stream_handler(char* args) {
     cmd_response_t response = {1, ""};
     if (app_state != APP_IDLE) {
@@ -1012,7 +1087,7 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
         return response;
     }
 
-    // Determine filename
+    // 解析目标文件名
     char filename[64];
     if (args != NULL && args[0] != '\0') {
         while(*args == ' ' || *args == ':') args++;
@@ -1028,13 +1103,13 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
 
     int sps = 250;
     current_sps = sps;
-    target_samples = 60 * 60 * sps; // 1 hour max
+    target_samples = 60 * 60 * sps; // 最长允许连续采集 1 小时
 
-    // Configure ADS1299
+    // 配置 ADS1299
     ADS1299_Stop();
     
-    // 1. Set Sample Rate (Use global config)
-    uint8_t sps_code = 0x06; // Default 250
+    // 1. 设置采样率 (使用全局配置)
+    uint8_t sps_code = 0x06; // 默认为 250 SPS
     if (g_cfg_sps == 250) sps_code = 0x06;
     else if (g_cfg_sps == 500) sps_code = 0x05;
     else if (g_cfg_sps == 1000) sps_code = 0x04;
@@ -1045,62 +1120,61 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
 
     ADS1299_Set_Sample_Parameter(sps_code, 6, 0); 
     
-    // 1.5. Configure CONFIG2 (0x02)
-    ADS1299_Write_Reg(0x02, 0xC0); // External signal - Reset to default to clear any test signals
+    // 1.5. 配置 CONFIG2 (0x02)
+    ADS1299_Write_Reg(0x02, 0xC0); // 恢复为外部正常输入，清除任何内部测试信号
 
-    // 2. Set Channels and Gain
+    // 2. 配置通道的增益和输入模式
     uint8_t gain_bits = get_gain_code(g_cfg_gain);
     for(int i=1; i<=8; i++) { 
        if (g_cfg_ch_mask & (1 << (i-1))) {
            ADS1299_Write_Reg(0x04 + i, gain_bits | (g_cfg_input_type & 0x07)); 
        } else {
-           ADS1299_Write_Reg(0x04 + i, 0x80 | 0x01); 
+           ADS1299_Write_Reg(0x04 + i, 0x80 | 0x01); // 关断并短接未启用的通道
        }
     } 
 
-    // 3. Configure Bias (RLD) - Initial Setup
-    // ONLY use CH6, CH7, CH8 for BIAS_SENSP (0xE0) to ensure RLD loop stability.
+    // 3. 配置右腿驱动偏置网络 (RLD BIAS) - 初始设置
+    // 强烈建议只使用 CH6, CH7, CH8 参与偏置网络以保证模拟环路稳定
     if (g_cfg_bias_en) {
         ADS1299_Write_Reg(0x03, 0xEC); 
-        ADS1299_Write_Reg(0x0D, 0xE0); // Enable BIAS_SENSP for CH6, CH7, CH8 only (1110 0000)
-        current_bias_sensp_mask = 0xE0; // Initialize tracking variable
+        ADS1299_Write_Reg(0x0D, 0xE0); // 仅启用 CH6, CH7, CH8 的 BIAS_SENSP (1110 0000)
+        current_bias_sensp_mask = 0xE0; // 初始化运行时掩码记录
     } else {
         ADS1299_Write_Reg(0x03, 0xE8);
         ADS1299_Write_Reg(0x0D, 0x00);
         current_bias_sensp_mask = 0x00;
     } 
 
-    // 4. Configure Lead-Off Detection (P-pole only as requested)
-    // CONFIG4 (0x17): Enable Lead-Off Comparator (Bit 1)
+    // 4. 配置导联脱落检测 (仅启用正极 P-pole)
+    // CONFIG4 (0x17): 开启导联脱落硬件比较器 (Bit 1)
     ADS1299_Write_Reg(0x17, 0x02); // PD_LOFF_COMP = 1
 
-    // LOFF (0x04): DC Lead-off, 6nA (Bits: 000 0 00 00) => 0x00
+    // LOFF (0x04): 直流脱落检测, 注入电流 6nA (Bits: 000 0 00 00) => 0x00
     ADS1299_Write_Reg(0x04, 0x00); 
 
-    // LOFF_SENSP (0x0F): Enable P-side LOFF for active channels
+    // LOFF_SENSP (0x0F): 为当前活动的所有正极输入开启脱落检测
     ADS1299_Write_Reg(0x0F, g_cfg_ch_mask); 
 
-    // LOFF_SENSN (0x10): Disable N-side LOFF (0x00)
+    // LOFF_SENSN (0x10): 禁用负极的脱落检测 (0x00)
     ADS1299_Write_Reg(0x10, 0x00);
     
-    // LOFF_FLIP (0x11): Disable current direction flip
+    // LOFF_FLIP (0x11): 禁用电流方向翻转
     ADS1299_Write_Reg(0x11, 0x00);
 
-    // Play 3.wav
-    Wav_Play("AUDIO/3.wav");
-    while(is_playing) {
-        Wav_Process();
-    }
+    // 播放提示音 7.wav (开始采集)
+    Play_System_Audio(7);
     
-    // Open file
+    // 打开/创建目标文件
     FRESULT fr = f_open(&SDFile, filename, FA_CREATE_ALWAYS | FA_WRITE);
     if (fr != FR_OK) {
         response.success = 0;
         sprintf(response.message, "ERR: Failed to open %s (%d)", filename, fr);
         return response;
     }
+    
+    g_write_sd_enabled = 1; // 启用 SD 卡写入
 
-    // Write Binary Header
+    // 写入二进制文件头信息
     FileHeader_t header = {0};
     header.magic_word = 0x45454721; // "EEG!"
     header.version = 0x0100;
@@ -1117,10 +1191,10 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
     UINT bw;
     f_write(&SDFile, &header, sizeof(FileHeader_t), &bw);
 
-    // Reset bad channel history for the new session
+    // 重置历史脱落记录
     stream_bad_ch_history = 0;
 
-    // Dump Registers for verification
+    // 打印寄存器状态以供调试验证
     USB_Print("\r\n[BOOT] ADS1299 Registers before START (AUTO_STREAM):\r\n"); 
     uint8_t regs[24]; 
     ADS1299_Read_Regs(0x00, regs, 24); 
@@ -1146,18 +1220,24 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 CONF 指令，动态配置脑电采集的全局参数
+ * @param args 包含配置参数的字符串 (格式: MASK,GAIN,SPS,INPUT_TYPE,BIAS_EN)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 仅在空闲状态下修改全局配置，实际生效需要等到下一次 START 指令
+ */
 cmd_response_t cmd_conf_handler(char* args) {
     cmd_response_t response = {1, ""};
     
-    // Default values if parsing fails
+    // 如果解析失败，使用默认值
     unsigned int mask = 0xFF;
     int gain = 24;
     int sps = 250;
     int input_type = 0;
     int bias_en = 1;
     
-    // Parse args: CONF:MASK(hex),GAIN,SPS,INPUT_TYPE,BIAS_EN
-    // Example: CONF:FF,24,250,0,1
+    // 解析参数: CONF:MASK(16进制),GAIN,SPS,INPUT_TYPE,BIAS_EN
+    // 示例: CONF:FF,24,250,0,1
     if (args == NULL || args[0] == '\0') {
          sprintf(response.message, "Current Config: Mask=0x%02X, Gain=%d, SPS=%d, Input=%d, Bias=%d", 
                  g_cfg_ch_mask, g_cfg_gain, g_cfg_sps, g_cfg_input_type, g_cfg_bias_en);
@@ -1182,6 +1262,12 @@ cmd_response_t cmd_conf_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 POWER_TEST 指令，启动系统极限功耗测试
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 同时开启脑电采集、SD 卡写入、循环音频播放和 LED 常亮，以评估电池极限续航
+ */
 cmd_response_t cmd_power_test_handler(char* args) {
     cmd_response_t response = {1, ""};
     
@@ -1191,7 +1277,7 @@ cmd_response_t cmd_power_test_handler(char* args) {
         return response;
     }
     
-    // 1. Open SD File for continuous writing
+    // 1. 打开 SD 卡文件用于连续写入测试数据
     FRESULT fr = f_open(&SDFile, "PWR_TEST.BIN", FA_CREATE_ALWAYS | FA_WRITE);
     if (fr != FR_OK) {
         response.success = 0;
@@ -1199,28 +1285,28 @@ cmd_response_t cmd_power_test_handler(char* args) {
         return response;
     }
     
-    // 2. Start ADS1299 (Max Power: All channels ON, Gain 24, 250 SPS)
+    // 2. 启动 ADS1299 (最高功耗模式: 全通道开启，24倍增益，250 SPS)
     ADS1299_Stop();
     ADS1299_Set_Sample_Parameter(0x06, 6, 0); // 250SPS
     
-    // Enable all channels, Gain 24, Normal Input
+    // 开启所有通道
     for(int i=1; i<=8; i++) {
         ADS1299_Write_Reg(0x04 + i, 0x60); 
     }
-    // Enable BIAS
+    // 开启右腿驱动偏置
     ADS1299_Write_Reg(0x03, 0xEC); 
     ADS1299_Write_Reg(0x0D, 0xFF); 
     
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
     
-    // 3. Start Audio Loop (Play 3.wav continuously in loop)
+    // 3. 启动音频循环播放 (在底层实现中死循环播放 3.wav)
     Wav_Play("AUDIO/3.wav"); 
     
-    // 4. Turn ON LED
+    // 4. 点亮 LED
     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET);
     
-    // 5. Set State to POWER_TEST
+    // 5. 切换到极限功耗测试状态
     app_state = APP_POWER_TEST_RUNNING;
     start_time = HAL_GetTick();
     sample_count = 0;
@@ -1229,6 +1315,12 @@ cmd_response_t cmd_power_test_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 ADC_TEST 指令，启动电池电压连续记录测试
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 每隔 0.5 秒读取一次电池电压并以 CSV 格式追加到 SD 卡的 adc.txt 文件中
+ */
 cmd_response_t cmd_adc_test_handler(char* args) {
     cmd_response_t response = {1, ""};
     
@@ -1238,7 +1330,7 @@ cmd_response_t cmd_adc_test_handler(char* args) {
         return response;
     }
     
-    // Open adc.txt for appending
+    // 以追加模式打开 adc.txt
     FRESULT fr = f_open(&SDFile, "adc.txt", FA_OPEN_ALWAYS | FA_WRITE);
     if (fr != FR_OK) {
         response.success = 0;
@@ -1246,22 +1338,28 @@ cmd_response_t cmd_adc_test_handler(char* args) {
         return response;
     }
     
-    // Move to end of file
+    // 移动指针到文件末尾
     f_lseek(&SDFile, f_size(&SDFile));
     
-    // Write header
+    // 写入 CSV 表头
     char header[] = "Timestamp_ms,Raw_ADC,Voltage_V,Percent\r\n";
     UINT bw;
     f_write(&SDFile, header, strlen(header), &bw);
     f_sync(&SDFile);
     
     app_state = APP_ADC_TEST_RUNNING;
-    start_time = HAL_GetTick(); // Use start_time to track last log time
+    start_time = HAL_GetTick(); // 记录起始时间用于控制记录间隔
     
     strcpy(response.message, "OK: ADC Logging Started (0.5s interval). Send STOP to end.");
     return response;
 }
 
+/**
+ * @brief 处理 STOP 指令，安全停止当前所有正在进行的任务
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 停止采集、关闭正在写入的文件、停止音频并返回空闲状态
+ */
 cmd_response_t cmd_stop_handler(char* args) {
     cmd_response_t response = {1, "OK: Stopping..."};
     
@@ -1271,35 +1369,121 @@ cmd_response_t cmd_stop_handler(char* args) {
         return response;
     }
     
-    // Immediately close file if recording to prevent lock errors on subsequent commands (e.g. GET)
+    // 立即关闭记录文件，防止锁死引发后续操作错误 (如 GET 文件)
     if (app_state == APP_QUAD_RUNNING || app_state == APP_STREAM_RUNNING || app_state == APP_AUTO_STREAM_RUNNING || app_state == APP_POWER_TEST_RUNNING || app_state == APP_ADC_TEST_RUNNING || app_state == APP_IMP_TEST_ALL_RUNNING) {
-        if (app_state != APP_ADC_TEST_RUNNING) ADS1299_Stop(); // Only stop ADS1299 if it was running
+        if (app_state != APP_ADC_TEST_RUNNING) ADS1299_Stop(); // 仅在有脑电任务时停止 ADS1299
         f_close(&SDFile);
     }
     
-    // Also stop audio if playing during power test
-    // Stop any AD5933 sweeps if running
-    
+    // 触发停止请求状态，由主循环安全收尾
     app_state = APP_STOP_REQUESTED;
-    
-    // In case we were in binary impedance mode, we should revert or stay depending on needs.
-    // We can just leave g_use_binary_protocol as is, because the STOP command itself 
-    // will send its response via the command system based on its origin.
     
     return response;
 }
 
-// Static float buffers for IMU data sharing
+/**
+ * @brief 处理 PAUSE 指令，暂停当前的在线采集
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 仅支持在线模式下的暂停，并播放暂停音效
+ */
+cmd_response_t cmd_pause_handler(char* args) {
+    cmd_response_t response = {1, "OK: Streaming Paused"};
+    
+    // 仅针对未写 SD 卡的在线实时流模式有效
+    if (app_state == APP_STREAM_RUNNING && g_write_sd_enabled == 0) {
+        ADS1299_Stop();
+        app_state = APP_STREAM_PAUSED;
+        Play_System_Audio(9); // 播放 COLLECT_PAUSE 音效
+    } else {
+        response.success = 0;
+        strcpy(response.message, "ERR: Only online streaming can be paused");
+    }
+    
+    return response;
+}
+
+/**
+ * @brief 处理 RESUME 指令，恢复之前暂停的在线采集
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 从暂停点无缝继续，不清空环形缓冲区
+ */
+cmd_response_t cmd_resume_handler(char* args) {
+    cmd_response_t response = {1, "OK: Streaming Resumed"};
+    
+    if (app_state == APP_STREAM_PAUSED && g_write_sd_enabled == 0) {
+        Play_System_Audio(10); // 播放 COLLECT_RESUME 音效
+        
+        ADS1299_Start();
+        // 注意：这里不要清空环形缓冲区，以免丢失暂停瞬间的数据
+        // circular_buffer_clear(&ADS1299_circula_buffer);
+        
+        app_state = APP_STREAM_RUNNING;
+    } else {
+        response.success = 0;
+        strcpy(response.message, "ERR: Stream is not paused");
+    }
+    
+    return response;
+}
+
+/**
+ * @brief 处理 STOP_IMP 指令，结束阻抗测试并进行语音播报反馈
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 评估 8 个通道的最终阻抗，若全部通过(或7个通过且平均值小于200k)播报成功，否则播报失败
+ */
+cmd_response_t cmd_stop_imp_handler(char* args) {
+    cmd_response_t response = {1, "OK: Impedance Stopped"};
+    
+    if (app_state == APP_IMP_TEST_ALL_RUNNING) {
+        int pass_count = 0;
+        float sum = 0.0f;
+        
+        for(int i=0; i<8; i++) {
+            if (g_latest_impedances[i] < 100000.0f) {
+                pass_count++;
+            }
+            sum += g_latest_impedances[i];
+        }
+        float avg = sum / 8.0f;
+        
+        // 成功判定标准：8个通道全通，或者至少7个通且平均阻抗小于 200kOhm
+        if (pass_count == 8 || (pass_count >= 7 && avg < 200000.0f)) {
+            Play_System_Audio(5); // 播放 IMPEDANCE_END_OK 语音
+        } else {
+            Play_System_Audio(6); // 播放 IMPEDANCE_END_FAIL 语音
+        }
+        
+        ADS1299_Stop();
+        app_state = APP_IDLE;
+        RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_SOLID_ON); // 恢复蓝灯常亮
+    } else {
+        response.success = 0;
+        strcpy(response.message, "ERR: Not in impedance test");
+    }
+    
+    return response;
+}
+
+// 用于在中断与主循环间共享 IMU 数据的静态缓冲
 static float g_latest_acc[3] = {0};
 static float g_latest_gyro[3] = {0};
 static uint8_t g_latest_motion_state = 0;
 
+float g_latest_impedances[8] = {0};
+
+/**
+ * @brief 系统核心超级状态机与数据处理主循环
+ * @note 负责 OTA 文件落盘、停止指令的收尾、ADC 记录、IMU 运动评估以及 ADS1299 数据包的解析、打包与下发
+ */
 void app_run_loop(void) {
-    // Check for OTA Completion Flag from Interrupt
+    // 检查来自 USB 中断的 OTA 传输完成标志
     if (g_ota_complete_flag) {
         g_ota_complete_flag = 0;
         
-        // Now we are in Main Loop context, safe to call FatFS and Reset
+        // 此时已处于主循环上下文，可安全调用 FatFS 关闭文件和重启
         FRESULT fr_close = f_close(&ota_fil);
         uint32_t duration = HAL_GetTick() - ota_start_tick;
         
@@ -1307,10 +1491,10 @@ void app_run_loop(void) {
             USB_Print("\r\n[OTA] Transfer Complete. %lu bytes.\r\n", ota_received_bytes);
             USB_Print("[OTA] Time: %lu ms. Auto-resetting in 1s...\r\n", duration);
             
-            // Wait for USB transmission to finish
+            // 等待最后的 USB 消息发送完毕
             HAL_Delay(1000);
             
-            // Perform System Reset
+            // 执行系统软复位，进入 Bootloader
             NVIC_SystemReset();
         } else {
             USB_Print("\r\n[OTA] Error: File Close Failed (%d)\r\n", fr_close);
@@ -1322,12 +1506,8 @@ void app_run_loop(void) {
     if (app_state == APP_STOP_REQUESTED) {
         ADS1299_Stop();
         
-        // Fix: Always try to close the file when stopping, to ensure no file is left open.
-        // It's safe to call f_close on an already closed file object if we are careful, 
-        // or we can track if it's open. 
-        // Given the bug was "File not found (16)" which means LOCKED, we must ensure close.
-        // We don't know the previous state here because it was overwritten to APP_STOP_REQUESTED.
-        // So we just close it.
+        // 修复：在停止时总是尝试关闭 SD 文件对象，确保没有遗留锁死的文件句柄
+        // 在空闲或覆盖状态下关闭已关闭的文件是相对安全的
         f_close(&SDFile);
         USB_Print("File closed (if open).\r\n");
 
@@ -1336,23 +1516,20 @@ void app_run_loop(void) {
         // 只要回到空闲状态，无论从哪个模式，都恢复蓝灯常亮
         RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_SOLID_ON);
         
-        if (g_task_state == 2) { // RUNNING
-            g_task_state = 3; // COMPLETED
+        if (g_task_state == 2) { // 任务正在运行
+            g_task_state = 3; // 标记为已完成
             
-            // Clear Task State in Backup Register
+            // 清除备份寄存器中的任务状态和任务 ID
             BackupReg_Write(BKP_REG_TASK_STATE, 0);
             BackupReg_Write(BKP_REG_TASK_ID, 0);
         }
         
-        // Play 4.wav after stopping collection
-        Wav_Play("AUDIO/4.wav");
-        while(is_playing) {
-            Wav_Process();
-        }
+        // 停止采集后播放 13.wav (COLLECT_END) 提示音
+        Play_System_Audio(13);
         
         USB_Print("Acquisition Stopped. Saved %lu samples.\r\n", sample_count);
         
-        // Report bad channels history if any
+        // 报告采集过程中出现的坏道历史
         if (stream_bad_ch_history != 0) {
              USB_Print("Warning: Bad channels detected during session: 0x%02X\r\n", stream_bad_ch_history);
         }
@@ -1364,17 +1541,17 @@ void app_run_loop(void) {
         if (HAL_GetTick() - start_time >= 500) {
             start_time = HAL_GetTick();
             
-            // Read ADC
+            // 启动 ADC 读取
             HAL_ADC_Start(&hadc1);
             if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK) {
                 uint32_t raw = HAL_ADC_GetValue(&hadc1);
-                // Updated formula based on 4.2V (Raw 4031) and 3.7V (Raw 3519) measurements
+                // 基于实测的 4.2V (Raw 4031) 和 3.7V (Raw 3519) 进行电压换算
                 float voltage = ((float)raw * 0.00097656f) + 0.2635f;
                 float percentage = (voltage - 3.6f) / (4.1f - 3.6f) * 100.0f;
                 if (percentage < 0) percentage = 0;
                 if (percentage > 100) percentage = 100;
                 
-                // Log to SD
+                // 记录到 SD 卡
                 char line[64];
                 int len = snprintf(line, sizeof(line), "%lu,%lu,%.3f,%.1f\r\n", 
                                    HAL_GetTick(), raw, voltage, percentage);
@@ -1383,7 +1560,7 @@ void app_run_loop(void) {
                 f_write(&SDFile, line, len, &bw);
                 f_sync(&SDFile);
                 
-                // Print to USB for real-time check
+                // 通过 USB 打印以供实时监测
                 USB_Print("ADC: Raw=%lu, V=%.3f, P=%.1f%%\r\n", raw, voltage, percentage);
             }
         }
@@ -1392,7 +1569,7 @@ void app_run_loop(void) {
     if (app_state == APP_SINGLE_RUNNING || app_state == APP_QUAD_RUNNING || app_state == APP_STREAM_RUNNING || app_state == APP_AUTO_STREAM_RUNNING || app_state == APP_IMP_TEST_RUNNING || app_state == APP_NOISE_TEST_RUNNING || app_state == APP_CMRR_TEST_RUNNING || app_state == APP_CMRR_STEP1_RUNNING || app_state == APP_CMRR_STEP2_RUNNING || app_state == APP_IMP_TEST_ALL_RUNNING || app_state == APP_RLD_TEST_RUNNING || app_state == APP_POWER_TEST_RUNNING) 
 			{
         
-        // --- AUX Data Handling (50Hz Sampling, 1Hz Output) for STREAM mode ---
+        // --- 辅助数据处理 (50Hz 采样, 1Hz 输出) 适用于 STREAM 模式 ---
         if (app_state == APP_STREAM_RUNNING) {
             
             static uint32_t last_aux_sample_time = 0;
@@ -1402,12 +1579,12 @@ void app_run_loop(void) {
             static float last_acc[3] = {0};
             static uint8_t first_sample = 1;
 
-            // 50Hz Sampling Interval = 20ms
+            // 50Hz 采样间隔 = 20ms
             if (HAL_GetTick() - last_aux_sample_time >= 20) {
                 float acc[3], gyro[3];
-                QMI8658_Read_XYZ(acc, gyro); // Read IMU
+                QMI8658_Read_XYZ(acc, gyro); // 读取 IMU 数据
                 
-                // Update global cache for binary stream
+                // 更新全局缓存供二进制流打包使用
                 g_latest_acc[0] = acc[0]; g_latest_acc[1] = acc[1]; g_latest_acc[2] = acc[2];
                 g_latest_gyro[0] = gyro[0]; g_latest_gyro[1] = gyro[1]; g_latest_gyro[2] = gyro[2];
 
@@ -1418,13 +1595,13 @@ void app_run_loop(void) {
                     first_sample = 0;
                 }
 
-                // 1. Calculate Acceleration Jerk (Manhattan Distance of diff)
+                // 1. 计算加速度突变 (Jerk) - 曼哈顿距离差
                 // |Ax_t - Ax_t-1| + |Ay_t - Ay_t-1| + |Az_t - Az_t-1|
                 float acc_diff = fabsf(acc[0] - last_acc[0]) + 
                                  fabsf(acc[1] - last_acc[1]) + 
                                  fabsf(acc[2] - last_acc[2]);
                 
-                // Clamp extreme spikes (acc_diff > 0.5g)
+                // 钳制极端尖峰 (acc_diff > 0.5g)
                 if (acc_diff > 0.5f) acc_diff = 0.5f;
 
                 // Update last acc
@@ -1468,6 +1645,15 @@ void app_run_loop(void) {
                 // Call the new Anti-False-Positive and State Machine Layer
                 motion_state_t final_state = Motion_State_Update(motion_score);
                 g_latest_motion_state = (uint8_t)final_state;
+                
+                // Trigger ARTIFACT_HIGH Audio
+                if (final_state == MOTION_SEVERE || final_state == MOTION_ARTIFACT) {
+                    static uint32_t last_motion_warn = 0;
+                    if (HAL_GetTick() - last_motion_warn > 10000) { // 10秒防抖
+                        Play_System_Audio(11); // ARTIFACT_HIGH
+                        last_motion_warn = HAL_GetTick();
+                    }
+                }
 
                 if (g_use_binary_protocol) {
                      // Binary AUX Packet (TYPE=0x05)
@@ -1520,40 +1706,40 @@ void app_run_loop(void) {
         }
         // -----------------------------------------------
 
-        // Check timeout
+        // 检查超时限制
         if (sample_count >= target_samples) {
             app_state = APP_STOP_REQUESTED;
             return;
         }
 
         uint8_t packet[27];
-        // ADS1299 packet: 3 bytes status + 8 * 3 bytes data = 27 bytes
+        // ADS1299 数据包: 3 字节状态字 + 8 * 3 字节数据 = 27 字节
         while (circular_buffer_get_data_count(&ADS1299_circula_buffer) >= 27) {
-            // Frame Sync Check: peek at the first byte to verify it's the ADS1299 status header (0xC0)
+            // 帧同步检查: 探查第一个字节以验证其是否为 ADS1299 状态字头 (0xC0)
             uint8_t header_byte;
             circular_buffer_pop(&ADS1299_circula_buffer, &header_byte);
             
             if ((header_byte & 0xF0) != 0xC0) {
-                // Misaligned frame detected! Drop this byte and continue searching for the 0xC0 header.
+                // 检测到帧未对齐！丢弃此字节并继续搜索 0xC0 帧头。
                 continue;
             }
             
-            // Valid header found. Put it in packet[0] and read the remaining 26 bytes.
+            // 找到有效的帧头。将其放入 packet[0] 并读取剩余的 26 字节。
             packet[0] = header_byte;
             circular_buffer_read(&ADS1299_circula_buffer, &packet[1], 26);
             
             static char line[256];
             int len = 0;
             
-            // Gain 24, Vref=4.5V
-            // 4.5V / (2^23 - 1) = 0.53644 uV (LSB at Gain=1)
-            // scale unit: uV / LSB
+            // 增益 24, Vref=4.5V
+            // 4.5V / (2^23 - 1) = 0.53644 uV (在增益为 1 时的 LSB)
+            // 换算单位: uV / LSB
             float gain_val = (float)g_cfg_gain;
-            if (gain_val < 1.0f) gain_val = 1.0f; // Safety check
+            if (gain_val < 1.0f) gain_val = 1.0f; // 安全检查
             float scale = 0.5364f / gain_val; 
 
             if (app_state == APP_CMRR_STEP1_RUNNING) {
-                // Step 1: Differential Gain
+                // 步骤 1: 测量差模增益
                 for(int i=0; i<8; i++) {
                     int ch_offset = 3 + i * 3;
                     int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
@@ -1576,7 +1762,7 @@ void app_run_loop(void) {
                 }
             }
             else if (app_state == APP_CMRR_STEP2_RUNNING) {
-                // Step 2: Common Mode Gain & Final Calculation
+                // 步骤 2: 共模增益及最终结果计算
                 for(int i=0; i<8; i++) {
                     int ch_offset = 3 + i * 3;
                     int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
@@ -1589,9 +1775,7 @@ void app_run_loop(void) {
                     USB_Print("=== Final CMRR Results ===\r\n");
                     USB_Print("CH | Diff Gain | Comm Gain | CMRR (dB)\r\n");
                     USB_Print("---|-----------|-----------|----------\r\n");
-                    const float Vin_comm_rms = 2.0f * 0.7071f; // 2Vpp = 0.7071 Vrms? Wait.
-                    // Assuming user input 2Vpp means 2V Peak-to-Peak. Vrms = 2 / (2*sqrt(2)) = 0.7071
-                    // Correct.
+                    const float Vin_comm_rms = 2.0f * 0.7071f; // 假设输入 2Vpp，即 Vrms = 2 / (2*sqrt(2)) = 0.7071
                     
                     for(int i=0; i<8; i++) {
                         double vout_comm_rms = sqrt(cmrr_step2_sum_sq[i] / target_samples);
@@ -1601,7 +1785,7 @@ void app_run_loop(void) {
                         double cmrr_db = 20.0 * log10(cmrr_ratio);
                         
                         USB_Print(" %d | %9.2f | %9.2e | %9.2f\r\n", 
-                                  i+1, cmrr_diff_gain[i], comm_gain, cmrr_db);//
+                                  i+1, cmrr_diff_gain[i], comm_gain, cmrr_db);
                     }
                 }
             }
@@ -1610,11 +1794,10 @@ void app_run_loop(void) {
                     int ch_offset = 3 + i * 3;
                     int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
                     if (val & 0x800000) val |= 0xFF000000;
-                    float voltage = (float)val * scale * 1e-6f; // Convert uV to Volts for calculation
+                    float voltage = (float)val * scale * 1e-6f; // 将 uV 转换为 Volts 以便计算
                     
-                    // We care about AC signal magnitude (RMS)
-                    // Simple RMS calculation assuming mean is close to 0 or removed by HPF
-                    // For more accuracy, we should subtract mean first, but here we just sum squares
+                    // 我们关注交流信号的幅度 (RMS)
+                    // 简单的 RMS 计算，假设均值接近于 0 或已被高通滤波器移除
                     cmrr_sum_sq[i] += (double)(voltage * voltage);
                 }
 
@@ -1626,7 +1809,7 @@ void app_run_loop(void) {
                     for(int i=0; i<8; i++) {
                         double vout_rms = sqrt(cmrr_sum_sq[i] / target_samples);
                         // CMRR = 20 * log10( (Gain * Vin) / Vout )
-                        // Gain = 24
+                        // 增益 = 24
                         double ratio = (24.0 * CMRR_VIN_RMS) / vout_rms;
                         double cmrr_db = 20.0 * log10(ratio);
                         
@@ -1636,12 +1819,12 @@ void app_run_loop(void) {
                 }
             }
             else if (app_state == APP_RLD_TEST_RUNNING) {
-                // RLD Test: Calculate RMS of AC Component (Standard Deviation)
+                // RLD 测试: 计算交流分量的 RMS (标准差)
                 for(int i=0; i<8; i++) {
                     int ch_offset = 3 + i * 3;
                     int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
                     if (val & 0x800000) val |= 0xFF000000;
-                    float voltage = (float)val * scale; // uV (Note: scale is uV/LSB in line 673)
+                    float voltage = (float)val * scale; // uV (注意: scale 单位是 uV/LSB)
                     
                     rld_sum[i] += voltage;
                     rld_sum_sq[i] += (double)(voltage * voltage);
@@ -1674,7 +1857,7 @@ void app_run_loop(void) {
                     if (voltage > noise_max[i]) noise_max[i] = voltage;
                 }
                 
-                // Check if done (last sample)
+                // 检查是否完成 (最后一个样本)
                 if (sample_count >= target_samples - 1) { 
                      USB_SendString("\r\n[TEST_NOISE] Analysis Result (uV):\r\n");
                      USB_SendString("CH | Mean (Offset) | Noise (RMS) | P-P (Peak-to-Peak)\r\n");
@@ -1693,22 +1876,28 @@ void app_run_loop(void) {
                 }
             }
             else if (app_state == APP_POWER_TEST_RUNNING) {
-                // Just writing to file, handled by file writing loop if applicable.
-                // In this simplified version, we just let the data flow.
-                // If we want to verify data integrity or format, we could add checks here.
-                // For power test, the main goal is keeping peripherals busy.
+                // 仅写入文件，由文件写入循环处理
+                // 在这个简化版本中，我们只是让数据流动
                 
-                // Write data to SD card (if not using DMA directly to SD)
-                // For simplicity, we are not writing EEG data to SD in this loop 
-                // because SD writing is typically handled by buffering or separate task.
-                // However, let's simulate SD activity by writing a chunk periodically.
-                // Actually, 'PWR_TEST.BIN' was opened in write mode. 
-                // Let's write the packet to it to maximize power consumption.
+                // 将数据写入 SD 卡
                 UINT bw;
                 f_write(&SDFile, packet, 27, &bw);
             }
             else if (app_state == APP_IMP_TEST_ALL_RUNNING) {
-                // 8-Channel Impedance Logic
+                // 提取硬件导联脱落状态字 (LOFF_STATP)
+                uint8_t loff_statp = 0;
+                if (packet[0] & 0x08) loff_statp |= 0x80; // Ch8
+                if (packet[0] & 0x04) loff_statp |= 0x40; // Ch7
+                if (packet[0] & 0x02) loff_statp |= 0x20; // Ch6
+                if (packet[0] & 0x01) loff_statp |= 0x10; // Ch5
+                if (packet[1] & 0x80) loff_statp |= 0x08; // Ch4
+                if (packet[1] & 0x40) loff_statp |= 0x04; // Ch3
+                if (packet[1] & 0x20) loff_statp |= 0x02; // Ch2
+                if (packet[1] & 0x10) loff_statp |= 0x01; // Ch1
+
+                static uint8_t imp_lead_off_flag[8] = {0};
+
+                // 8 通道阻抗逻辑
                 for(int i=0; i<8; i++) {
                     int ch_offset = 3 + i * 3;
                     int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
@@ -1717,33 +1906,50 @@ void app_run_loop(void) {
 
                     if (voltage > imp_all_max[i]) imp_all_max[i] = voltage;
                     if (voltage < imp_all_min[i]) imp_all_min[i] = voltage;
+
+                    // 只要在 0.5s 窗口内出现过一次脱落标志，就判定为脱落
+                    if (loff_statp & (1 << i)) {
+                        imp_lead_off_flag[i] = 1;
+                    }
                 }
                 
                 imp_window_count++;
 
-                // Calculate Impedance every 0.5 second (125 samples)
+                // 每 0.5 秒 (125 个样本) 计算一次阻抗
                 if (imp_window_count >= 125) {
                     float impedances[8];
+                    int pass_count = 0;
                     
                     for(int i=0; i<8; i++) {
                         float vpp = imp_all_max[i] - imp_all_min[i]; 
                         // Z = Vpp(uV) * 1e-6 / (2 * 24nA) = Vpp / 0.048
-                        // Current increased to 24nA to improve SNR
+                        // 电流增加到 24nA 以提高信噪比
                         impedances[i] = (vpp * 1e-6f) / 48.0e-9f;
+
+                        // 【新增】：硬件脱落否决逻辑
+                        if (imp_lead_off_flag[i]) {
+                            impedances[i] = 9999000.0f; // 强行拉满到 9999 kOhm
+                        }
+
+                        g_latest_impedances[i] = impedances[i]; // 全局存储以供 STOP_IMP 评估
                         
-                        // Reset
+                        // 检查是否 < 50kOhm (成功阈值)
+                        if (impedances[i] < 50000.0f) pass_count++;
+                        
+                        // 重置
                         imp_all_max[i] = -1e9;
                         imp_all_min[i] = 1e9;
+                        imp_lead_off_flag[i] = 0; // 重置脱落标志
                     }
                     
-                    // Format: IMP:F5:v,F3:v,FZ:v,F4:v,F6:v,AF8:v,FPZ:v,AF7:v
-                    // Values are in kOhm, capped at 9999
+                    // 格式: IMP:F5:v,F3:v,FZ:v,F4:v,F6:v,AF8:v,FPZ:v,AF7:v
+                    // 值单位为 kOhm，最大限制为 9999
                     
                     if (g_use_binary_protocol) {
                         uint8_t imp_payload[16];
                         for(int i=0; i<8; i++) {
-                             // Unit: 1 kOhm as per Word Document request (was 0.1kOhm before)
-                             // impedances[i] is in Ohms. Divide by 1000 to get kOhm.
+                             // 单位: 1 kOhm
+                             // impedances[i] 单位为 Ohm，除以 1000 得到 kOhm
                              float imp_kohm = impedances[i] / 1000.0f;
                              if (imp_kohm > 65535.0f) imp_kohm = 65535.0f;
                              uint16_t imp_val = (uint16_t)imp_kohm;
@@ -1772,46 +1978,46 @@ void app_run_loop(void) {
                 }
             }
             else if (app_state == APP_IMP_TEST_RUNNING) {
-                // Impedance Test Logic (CH1 only for now)
+                // 阻抗测试逻辑 (目前仅支持单通道 CH1)
                 int ch_offset = 3 + (current_channel - 1) * 3;
                 int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
                 if (val & 0x800000) val |= 0xFF000000;
-                float voltage = (float)val * scale; // Voltage in uV
+                float voltage = (float)val * scale; // 电压单位: uV
 
-                // Debug: Print Raw Hex and Voltage periodically
-                // Every 10th sample to avoid flooding too much, but enough to see
+                // 调试: 定期打印原始十六进制和电压
+                // 每 10 个样本打印一次以避免输出过多，但足以观察
                 if (imp_window_count % 10 == 0) {
                      len = snprintf(line, sizeof(line), "DBG: Hex=0x%06X, Val=%ld, Volts=%.2f uV\r\n", 
                                     (unsigned int)(val & 0xFFFFFF), (long)val, voltage);
                      CDC_Transmit_FS((uint8_t*)line, len);
                 }
 
-                // Update Max/Min
+                // 更新最大/最小值
                 if (voltage > imp_max_val) imp_max_val = voltage;
                 if (voltage < imp_min_val) imp_min_val = voltage;
                 imp_window_count++;
 
-                // Calculate Impedance periodically
+                // 定期计算阻抗
                 if (imp_window_count >= IMP_WINDOW_SIZE) {
-                    float vpp = imp_max_val - imp_min_val; // Peak-to-Peak Voltage (in uV)
+                    float vpp = imp_max_val - imp_min_val; // 峰峰值电压 (单位: uV)
                     
                     // Z = Vpp(uV) * 1e-6 / (2 * I_inj)
-                    // I_inj = 6nA = 6e-9 A (Configured via LOFF reg 0x01 -> ILEAD_OFF=00 -> 6nA)
+                    // I_inj = 6nA = 6e-9 A (通过 LOFF 寄存器 0x01 配置 -> ILEAD_OFF=00 -> 6nA)
                     // Z = Vpp(uV) * 1e-6 / 12e-9 = Vpp(uV) / 0.012
                     float raw_impedance = (vpp * 1e-6f) / (2.0f * 6.0e-9f);
                     
-                    // No calibration, use raw impedance
+                    // 无校准，使用原始阻抗
                     float impedance = raw_impedance;
                     
                     len = snprintf(line, sizeof(line), "Z: %.2f kOhm (Vpp: %.2f uV)\r\n", 
                                    impedance / 1000.0f, vpp);
                     CDC_Transmit_FS((uint8_t*)line, len);
 
-                    // Accumulate for average
+                    // 累加计算平均值
                     imp_sum += impedance;
                     imp_count++;
 
-                    // Reset for next window
+                    // 为下一个窗口重置
                     imp_max_val = -1e9;
                     imp_min_val = 1e9;
                     imp_window_count = 0;
@@ -1830,20 +2036,20 @@ void app_run_loop(void) {
                 float voltage = (float)val * scale;
                 
                 len = snprintf(line, sizeof(line), "%.2f\n", voltage);
-                // Note: SINGLE mode currently does not write to SD, as requested only for QUAD
+                // 注意: SINGLE 模式目前不写入 SD 卡，仅根据需求为 QUAD 模式写入
                 CDC_Transmit_FS((uint8_t*)line, len);
             } else if (app_state == APP_AUTO_STREAM_RUNNING) {
-                // Check Lead-Off (P-Pole)
-                // Status Byte 0: 1100 + IN8P..IN5P
-                // Status Byte 1: IN4P..IN1P + IN8N..IN5N
+                // 检查导联脱落 (正极)
+                // 状态字 0: 1100 + IN8P..IN5P
+                // 状态字 1: IN4P..IN1P + IN8N..IN5N
                 
                 uint8_t loff_statp = 0;
-                // IN8P..IN5P (Bits 3-0 of Byte 0) -> Map to Bits 7-4
+                // IN8P..IN5P (字节 0 的位 3-0) -> 映射到位 7-4
                 if (packet[0] & 0x08) loff_statp |= 0x80; // Ch8
                 if (packet[0] & 0x04) loff_statp |= 0x40; // Ch7
                 if (packet[0] & 0x02) loff_statp |= 0x20; // Ch6
                 if (packet[0] & 0x01) loff_statp |= 0x10; // Ch5
-                // IN4P..IN1P (Bits 7-4 of Byte 1) -> Map to Bits 3-0
+                // IN4P..IN1P (字节 1 的位 7-4) -> 映射到位 3-0
                 if (packet[1] & 0x80) loff_statp |= 0x08; // Ch4
                 if (packet[1] & 0x40) loff_statp |= 0x04; // Ch3
                 if (packet[1] & 0x20) loff_statp |= 0x02; // Ch2
@@ -1851,23 +2057,22 @@ void app_run_loop(void) {
                 
                 uint8_t bad_channels = loff_statp & current_bias_sensp_mask;
                 
-                // Track bad channels history
+                // 记录坏道历史
                 stream_bad_ch_history |= bad_channels;
                 
                 if (bad_channels != 0) {
-                     // [FIX] We no longer power down channels or modify BIAS on lead-off.
-                     // We just record the bad channels to history for status reporting.
-                     // The hardware continues to run all channels normally.
+                     // [FIX] 不再在导联脱落时关闭通道或修改 BIAS。
+                     // 仅记录坏道历史用于状态报告。硬件继续正常运行所有通道。
                      
-                     // Optional: You could still print a warning here if needed, 
-                     // but to avoid flooding the console, we rely on the binary status bits.
-                     /*
-                     USB_Print("[AUTO] Lead-off detected (Bad: 0x%02X). Continuing acquisition.\r\n", 
-                               bad_channels);
-                     */
+                     // 防抖：电极脱落报警，3秒内最多报一次
+                     static uint32_t last_loff_warn_auto = 0;
+                     if (HAL_GetTick() - last_loff_warn_auto > 3000) {
+                         Play_System_Audio(12); // ELECTRODE_LOST
+                         last_loff_warn_auto = HAL_GetTick();
+                     }
                 }
                 
-                // --- AUX Data Handling (50Hz Sampling, 1Hz Output) for AUTO_STREAM mode ---
+                // --- 辅助数据处理 (50Hz 采样, 1Hz 输出) 适用于 AUTO_STREAM 模式 ---
                 static uint32_t last_aux_sample_time = 0;
                 static uint32_t last_aux_output_time = 0;
                 static float avg_motion = 0.0f;
@@ -1875,10 +2080,10 @@ void app_run_loop(void) {
                 static float last_acc[3] = {0};
                 static uint8_t first_sample = 1;
 
-                // 50Hz Sampling Interval = 20ms
+                // 50Hz 采样间隔 = 20ms
                 if (HAL_GetTick() - last_aux_sample_time >= 20) {
                     float acc[3], gyro[3];
-                    QMI8658_Read_XYZ(acc, gyro); // Read IMU
+                    QMI8658_Read_XYZ(acc, gyro); // 读取 IMU 数据
 
                     g_latest_acc[0] = acc[0]; g_latest_acc[1] = acc[1]; g_latest_acc[2] = acc[2];
                     g_latest_gyro[0] = gyro[0]; g_latest_gyro[1] = gyro[1]; g_latest_gyro[2] = gyro[2];
@@ -1890,23 +2095,23 @@ void app_run_loop(void) {
                         first_sample = 0;
                     }
 
-                    // 1. Calculate Acceleration Jerk (Manhattan Distance of diff)
+                    // 1. 计算加速度突变 (曼哈顿距离差)
                     float acc_diff = fabsf(acc[0] - last_acc[0]) + 
                                      fabsf(acc[1] - last_acc[1]) + 
                                      fabsf(acc[2] - last_acc[2]);
                     
-                    // Clamp extreme spikes (acc_diff > 0.5g)
+                    // 钳制极端尖峰 (acc_diff > 0.5g)
                     if (acc_diff > 0.5f) acc_diff = 0.5f;
 
-                    // Update last acc
+                    // 更新最后一次的加速度
                     last_acc[0] = acc[0];
                     last_acc[1] = acc[1];
                     last_acc[2] = acc[2];
 
-                    // 2. Calculate Gyro Magnitude
+                    // 2. 计算陀螺仪幅值
                     float gyro_mag = sqrtf(gyro[0]*gyro[0] + gyro[1]*gyro[1] + gyro[2]*gyro[2]);
                     
-                    // Clamp extreme values (gyro_mag > 500 deg/s)
+                    // 钳制极端值 (gyro_mag > 500 deg/s)
                     if (gyro_mag > 500.0f) gyro_mag = 500.0f;
 
                     float energy_now = (50.0f * acc_diff) + (0.02f * gyro_mag);
@@ -1922,20 +2127,29 @@ void app_run_loop(void) {
                     last_aux_sample_time = HAL_GetTick();
                 }
 
-                // 1Hz Output
+                // 1Hz 输出
                 if (HAL_GetTick() - last_aux_output_time >= 1000) {
                     float acc[3], gyro[3];
-                    QMI8658_Read_XYZ(acc, gyro); // Read one latest sample for display
+                    QMI8658_Read_XYZ(acc, gyro); // 读取最新的一个样本用于显示
                     
                     float final_energy = (avg_motion > peak_energy) ? avg_motion : peak_energy;
                     
-                    // Motion Score Normalization (0-100)
+                    // 运动分数归一化 (0-100)
                     float motion_score = final_energy * 5.0f;
                     if (motion_score > 100.0f) motion_score = 100.0f;
                     if (motion_score < 0.0f) motion_score = 0.0f;
 
                     motion_state_t final_state = Motion_State_Update(motion_score);
                     g_latest_motion_state = (uint8_t)final_state;
+                    
+                    // 触发 ARTIFACT_HIGH 报警音
+                    if (final_state == MOTION_SEVERE || final_state == MOTION_ARTIFACT) {
+                        static uint32_t last_motion_warn_auto = 0;
+                        if (HAL_GetTick() - last_motion_warn_auto > 10000) { // 10秒防抖
+                            Play_System_Audio(11); // ARTIFACT_HIGH
+                            last_motion_warn_auto = HAL_GetTick();
+                        }
+                    }
 
                     if (g_use_binary_protocol) {
                         uint8_t aux_payload[16];
@@ -1977,15 +2191,15 @@ void app_run_loop(void) {
                     last_aux_output_time = HAL_GetTick();
                 }
                 
-                // Normal Stream Logic (Same as APP_STREAM_RUNNING)
+                // 常规流传输逻辑 (与 APP_STREAM_RUNNING 相同)
                 float voltages[8];
                 int32_t raw_vals[8];
                 
                 for(int i=0; i<8; i++) {
-                    // [FIX] Removed data cloning for lead-off channels.
-                    // We now parse the actual channel data regardless of its lead-off status.
-                    // If the electrode is off, the上位机 will see the real noise/railing, 
-                    // which is the medically correct behavior.
+                    // [FIX] 移除了对脱落通道的数据克隆。
+                    // 现在无论其脱落状态如何，我们都解析实际通道数据。
+                    // 如果电极脱落，上位机将看到真实的噪声/满偏信号，
+                    // 这是在医学上正确的行为。
                     
                     int ch_offset = 3 + i * 3;
                     int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
@@ -1996,12 +2210,12 @@ void app_run_loop(void) {
                 }
                 
                 if (g_use_binary_protocol) {
-                    // Status (3)
+                    // 状态字 (3字节)
                     g_bp_payload[0] = packet[0];
                     g_bp_payload[1] = packet[1];
                     g_bp_payload[2] = packet[2];
                     
-                    // Channels (32)
+                    // 通道数据 (32字节)
                     for(int i=0; i<8; i++) {
                         int32_t val = raw_vals[i];
                         
@@ -2011,9 +2225,9 @@ void app_run_loop(void) {
                         g_bp_payload[3 + i*4 + 3] = (val >> 24) & 0xFF;
                     }
                     
-                    // IMU (12)
+                    // IMU 数据 (12字节)
                     for(int k=0; k<3; k++) {
-                        int16_t acc_val = (int16_t)(g_latest_acc[k] * 1000.0f);//
+                        int16_t acc_val = (int16_t)(g_latest_acc[k] * 1000.0f);
                         int16_t gyro_val = (int16_t)(g_latest_gyro[k] * 10.0f);
                         
                         int acc_idx = 35 + k*2;
@@ -2028,17 +2242,17 @@ void app_run_loop(void) {
                     static uint16_t bin_seq = 0;
                     uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, g_bp_payload, 47);
                     
-                    // Direct Transmit (No Slow Down)
+                    // 直接发送 (无减速)
                     uint8_t usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
                     if (usb_res == USBD_BUSY) {
                         for(volatile int w=0; w<1000; w++); 
                         usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
                     }
                 } else {
-                    // EEG Data Transmission (Replaced LOFF status strings)
-                    len = snprintf(line, sizeof(line), "EEG:F5:%.2f,F3:%.2f,FZ:%.2f,F4:%.2f,F6:%.2f,AF8:%.2f,FPZ:%.2f,AF7:%.2f\r\n",
-                                   voltages[0], voltages[1], voltages[2], voltages[3],
-                                   voltages[4], voltages[5], voltages[6], voltages[7]);
+                    // EEG 数据传输 (替换了 LOFF 状态字符串)
+                    len = snprintf(line, sizeof(line), "EEG:C4:%.2f,C2:%.2f,CZ:%.2f,C1:%.2f,C3:%.2f,AF7:%.2f,FPZ:%.2f,AF8:%.2f\r\n",        
+                                   voltages[4], voltages[3], voltages[2], voltages[0],
+                                   voltages[1], voltages[7], voltages[6], voltages[5]);
                     
                     uint8_t usb_res = CDC_Transmit_FS((uint8_t*)line, len);
                     if (usb_res == USBD_BUSY) {
@@ -2049,19 +2263,19 @@ void app_run_loop(void) {
                     }
                 }
                 
-                // Write to SD Card (Binary DataFrame)
+                // 写入 SD 卡 (二进制数据帧)
                 DataFrame_t frame = {0};
                 frame.frame_seq = sample_count;
                 for(int i=0; i<8; i++) {
                     frame.eeg_data[i] = raw_vals[i];
                 }
                 for(int k=0; k<3; k++) {
-                    frame.acc[k] = (int16_t)(g_latest_acc[k] * 1000.0f);//
+                    frame.acc[k] = (int16_t)(g_latest_acc[k] * 1000.0f);
                     frame.gyro[k] = (int16_t)(g_latest_gyro[k] * 10.0f);
                 }
                 frame.motion_state = g_latest_motion_state;
                 
-                // Calculate simple checksum
+                // 计算简单的校验和
                 uint8_t *p_frame = (uint8_t*)&frame;
                 uint8_t chk = 0;
                 for(size_t i=0; i<sizeof(DataFrame_t)-1; i++) {
@@ -2069,62 +2283,61 @@ void app_run_loop(void) {
                 }
                 frame.checksum = chk;
                 
-                // [FIX] Commented out SD card write to prevent blocking the main loop
-                // which causes ADS1299 circular buffer overflow and frame misalignment
-                
-                UINT bw;
-                FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
-                if (fr == FR_OK && bw == sizeof(DataFrame_t)) {
-                    if (sample_count % 50 == 0) {
-                        f_sync(&SDFile);
+                // 仅在启用时写入 SD 卡 (二进制数据帧)
+                if (g_write_sd_enabled) {
+                    UINT bw;
+                    FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
+                    if (fr == FR_OK && bw == sizeof(DataFrame_t)) {
+                        if (sample_count % 50 == 0) {
+                            f_sync(&SDFile);
+                        }
                     }
                 }
                 
             } else if (app_state == APP_STREAM_RUNNING) {
-                // Check Lead-Off (P-Pole)
-                // Status Byte 0: 1100 + IN8P..IN5P (Bits 3-0)
-                // Status Byte 1: IN4P..IN1P (Bits 7-4) + IN8N..IN5N (Bits 3-0)
+                // 检查导联脱落 (正极)
+                // 状态字 0: 1100 + IN8P..IN5P (位 3-0)
+                // 状态字 1: IN4P..IN1P (位 7-4) + IN8N..IN5N (位 3-0)
                 
                 uint8_t loff_statp = 0;
-                // IN8P..IN5P (Bits 3-0 of Byte 0) -> Map to Bits 7-4
+                // IN8P..IN5P (字节 0 的位 3-0) -> 映射到位 7-4
                 if (packet[0] & 0x08) loff_statp |= 0x80; // Ch8
                 if (packet[0] & 0x04) loff_statp |= 0x40; // Ch7
                 if (packet[0] & 0x02) loff_statp |= 0x20; // Ch6
                 if (packet[0] & 0x01) loff_statp |= 0x10; // Ch5
-                // IN4P..IN1P (Bits 7-4 of Byte 1) -> Map to Bits 3-0
+                // IN4P..IN1P (字节 1 的位 7-4) -> 映射到位 3-0
                 if (packet[1] & 0x80) loff_statp |= 0x08; // Ch4
                 if (packet[1] & 0x40) loff_statp |= 0x04; // Ch3
                 if (packet[1] & 0x20) loff_statp |= 0x02; // Ch2
                 if (packet[1] & 0x10) loff_statp |= 0x01; // Ch1
                 
-                // Identify channels that are bad AND currently enabled in Bias
+                // 识别脱落且在偏置网络中启用的通道
                 uint8_t new_bad_channels = loff_statp & current_bias_sensp_mask;
                 
                 if (new_bad_channels != 0) {
-                     // [FIX] We no longer power down channels or modify BIAS on lead-off.
-                     // We just record the bad channels to history for status reporting.
-                     // The hardware continues to run all channels normally.
+                     // [FIX] 不再在导联脱落时关闭通道或修改 BIAS。
+                     // 仅记录坏道历史用于状态报告。硬件继续正常运行所有通道。
                      
-                     // Accumulate history
+                     // 累加历史记录
                      stream_bad_ch_history |= new_bad_channels;
                      
-                     // In ASCII mode, we can optionally print it (commented out to avoid flooding)
-                     /*
-                     if (!g_use_binary_protocol) {
-                         USB_Print("[STREAM] Bad channels detected: 0x%02X. Continuing acquisition.\r\n", new_bad_channels);
+                     // 防抖：电极脱落报警，3秒内最多报一次
+                     static uint32_t last_loff_warn = 0;
+                     if (HAL_GetTick() - last_loff_warn > 3000) {
+                         Play_System_Audio(12); // ELECTRODE_LOST
+                         last_loff_warn = HAL_GetTick();
                      }
-                     */
                 }
                 
                 float voltages[8];
                 int32_t raw_vals[8];
                 
-                // Parse values with channel replacement logic for lead-off channels
+                // 解析通道数据 (包含了脱落通道不克隆数据的逻辑)
                 for(int i=0; i<8; i++) {
-                    // [FIX] Removed data cloning for lead-off channels.
-                    // We now parse the actual channel data regardless of its lead-off status.
-                    // If the electrode is off, the上位机 will see the real noise/railing, 
-                    // which is the medically correct behavior.
+                    // [FIX] 移除了对脱落通道的数据克隆。
+                    // 现在无论其脱落状态如何，我们都解析实际通道数据。
+                    // 如果电极脱落，上位机将看到真实的噪声/满偏信号，
+                    // 这是在医学上正确的行为。
                     
                     int ch_offset = 3 + i * 3;
                     int32_t val = (packet[ch_offset] << 16) | (packet[ch_offset+1] << 8) | packet[ch_offset+2];
@@ -2134,11 +2347,11 @@ void app_run_loop(void) {
                     voltages[i] = (float)val * scale;
                 }
                 
-                // Format: EEG:SEQ:x,v1,v2,v3,v4,v5,v6,v7,v8\n
+                // 格式: EEG:SEQ:x,v1,v2,v3,v4,v5,v6,v7,v8\n
                 if (g_use_binary_protocol) {
-                    // Update Status Bytes with historical lead-off status so UI stays red
-                    // packet[0] Bits 3-0: CH8, CH7, CH6, CH5
-                    // packet[1] Bits 7-4: CH4, CH3, CH2, CH1
+                    // 使用历史脱落状态更新状态字节，以使 UI 保持红色警示
+                    // packet[0] 位 3-0: CH8, CH7, CH6, CH5
+                    // packet[1] 位 7-4: CH4, CH3, CH2, CH1
                     uint8_t pkt0 = packet[0];
                     uint8_t pkt1 = packet[1];
                     
@@ -2174,30 +2387,30 @@ void app_run_loop(void) {
                     static uint16_t bin_seq = 0;
                     uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, g_bp_payload, 47);
                     
-                    // Direct Transmit (No Slow Down)
+                    // 直接发送 (无减速)
                     uint8_t usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
                     if (usb_res == USBD_BUSY) {
-                         // Let's try a very short busy wait
+                         // 尝试非常短暂的忙等待
                          for(volatile int w=0; w<1000; w++); 
                          usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
                     }
                 } else {
-								    len = snprintf(line, sizeof(line), "EEG:F5:%.2f,F3:%.2f,FZ:%.2f,F4:%.2f,F6:%.2f,AF8:%.2f,FPZ:%.2f,AF7:%.2f\r\n",
-                                   voltages[0], voltages[1], voltages[2], voltages[3],
-                                   voltages[4], voltages[5], voltages[6], voltages[7]);
+								    len = snprintf(line, sizeof(line), "EEG:C4:%.2f,C2:%.2f,CZ:%.2f,C1:%.2f,C3:%.2f,AF7:%.2f,FPZ:%.2f,AF8:%.2f\r\n",        
+                                   voltages[4], voltages[3], voltages[2], voltages[0],
+                                   voltages[1], voltages[7], voltages[6], voltages[5]);
                     uint8_t usb_res = CDC_Transmit_FS((uint8_t*)line, len);
                     if (usb_res == USBD_BUSY) {
                         uint32_t retry_start = HAL_GetTick();
                         while (CDC_Transmit_FS((uint8_t*)line, len) == USBD_BUSY) {
-                            if (HAL_GetTick() - retry_start > 2) break; // 2ms timeout - don't block
+                            if (HAL_GetTick() - retry_start > 2) break; // 2ms 超时 - 不阻塞
                         }
                     }
                 }
                 
-                // Note: If USB is disconnected, CDC_Transmit_FS might return USBD_FAIL or just work (dropping data).
-                // The key is the timeout above prevents infinite waiting.
+                // 注意: 如果 USB 断开连接，CDC_Transmit_FS 可能会返回 USBD_FAIL 或直接丢弃数据。
+                // 关键在于上面的超时防止了无限等待。
                 
-                // Write to SD Card (Stream & Save Binary)
+                // 写入 SD 卡 (边流式传输边保存二进制)
                 DataFrame_t frame = {0};
                 frame.frame_seq = sample_count;
                 for(int i=0; i<8; i++) {
@@ -2209,7 +2422,7 @@ void app_run_loop(void) {
                 }
                 frame.motion_state = g_latest_motion_state;
                 
-                // Calculate simple checksum
+                // 计算简单的校验和
                 uint8_t *p_frame = (uint8_t*)&frame;
                 uint8_t chk = 0;
                 for(size_t i=0; i<sizeof(DataFrame_t)-1; i++) {
@@ -2217,21 +2430,22 @@ void app_run_loop(void) {
                 }
                 frame.checksum = chk;
                 
-                // Write to SD Card (Stream & Save Binary)
-                
-                UINT bw;
-                FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
-                if (fr != FR_OK || bw < sizeof(DataFrame_t)) {
-                    // SD Write Error - continue for now
-                } else {
-                    // Sync periodically (every 50 samples ~ 0.2s)
-                    if (sample_count % 50 == 0) {
-                        f_sync(&SDFile);
+                // 仅在启用时写入 SD 卡 (边流式传输边保存二进制)
+                if (g_write_sd_enabled) {
+                    UINT bw;
+                    FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
+                    if (fr != FR_OK || bw < sizeof(DataFrame_t)) {
+                        // SD 写入错误 - 暂且继续
+                    } else {
+                        // 定期同步 (每 50 个样本 ~ 0.2s)
+                        if (sample_count % 50 == 0) {
+                            f_sync(&SDFile);
+                        }
                     }
                 }
                 
             } else {
-                // QUAD (8-channel) mode
+                // QUAD (8 通道) 模式
                 DataFrame_t frame = {0};
                 frame.frame_seq = sample_count;
                 for(int i=0; i<8; i++) {
@@ -2246,7 +2460,7 @@ void app_run_loop(void) {
                 }
                 frame.motion_state = g_latest_motion_state;
                 
-                // Calculate simple checksum
+                // 计算简单的校验和
                 uint8_t *p_frame = (uint8_t*)&frame;
                 uint8_t chk = 0;
                 for(size_t i=0; i<sizeof(DataFrame_t)-1; i++) {
@@ -2254,15 +2468,17 @@ void app_run_loop(void) {
                 }
                 frame.checksum = chk;
                 
-                // Write to SD Card
-                UINT bw;
-                FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
-                if (fr != FR_OK || bw < sizeof(DataFrame_t)) {
-                    if (g_use_binary_protocol == 0) USB_Print("SD Write Err: %d\r\n", fr);
-                    app_state = APP_STOP_REQUESTED; // Stop on write error
-                } else {
-                    if (sample_count % 50 == 0) {
-                        f_sync(&SDFile);
+                // 仅在启用时写入 SD 卡
+                if (g_write_sd_enabled) {
+                    UINT bw;
+                    FRESULT fr = f_write(&SDFile, &frame, sizeof(DataFrame_t), &bw);
+                    if (fr != FR_OK || bw < sizeof(DataFrame_t)) {
+                        if (g_use_binary_protocol == 0) USB_Print("SD Write Err: %d\r\n", fr);
+                        app_state = APP_STOP_REQUESTED; // 写入错误时停止
+                    } else {
+                        if (sample_count % 50 == 0) {
+                            f_sync(&SDFile);
+                        }
                     }
                 }
             }
@@ -2277,6 +2493,12 @@ void app_run_loop(void) {
     }
 }
 
+/**
+ * @brief 处理 REG 指令，读取并打印 ADS1299 所有寄存器的当前配置值
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 必须在空闲状态(无采集运行)下执行，以便发送 SDATAC 指令停止连续数据模式并读取寄存器
+ */
 cmd_response_t cmd_reg_handler(char* args) {
     cmd_response_t response = {1, ""};
     
@@ -2289,11 +2511,11 @@ cmd_response_t cmd_reg_handler(char* args) {
     uint8_t regs[24];
     memset(regs, 0, 24);
 
-    // Ensure SDATAC mode
+    // 确保设备处于停止连续读取模式 (SDATAC) 才能读取寄存器
     ADS1299_Send_Cmd(ADS1299_SDATAC);
     HAL_Delay(10); 
 
-    // Read all registers (0x00 to 0x17)
+    // 读取所有寄存器 (0x00 到 0x17)
     ADS1299_Read_Regs(0x00, regs, 24);
 
     USB_Print("\r\n=== ADS1299 Registers ===\r\n");
@@ -2319,21 +2541,12 @@ cmd_response_t cmd_reg_handler(char* args) {
     return response;
 }
 
-cmd_response_t cmd_sweep_handler(char* args) {
-    cmd_response_t response = {1, ""};
-    
-    if (app_state != APP_IDLE) {
-        response.success = 0;
-        strcpy(response.message, "ERR: App busy");
-        return response;
-    }
-
-    // AD5933 is disabled in this hardware revision
-    response.success = 0;
-    strcpy(response.message, "ERR: AD5933 disabled");
-    return response;
-}
-
+/**
+ * @brief 处理 TEST_IMP 指令，启动单通道 (CH1) 阻抗测量测试
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 硬件配置: 注入 24nA 交流信号(fDR/4)，开启比较器，并在循环中打印交流阻抗
+ */
 cmd_response_t cmd_test_imp_handler(char* args) {
     cmd_response_t response = {1, ""};
 
@@ -2346,36 +2559,34 @@ cmd_response_t cmd_test_imp_handler(char* args) {
     ADS1299_Stop();
     HAL_Delay(10);
 
-    // Manual Register Configuration for Impedance Test
-    ADS1299_Write_Reg(0x00, 0x3E); // ID Control (Read Only, but user asked to set it?) - Actually ID is RO, usually 0x3E for ADS1299
-    ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: Daisy-chain disable, oscillator clock output disable, 250 SPS
-    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal test signal generation
-    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: Internal reference buffer enabled, VREF = 4.5V
-    ADS1299_Write_Reg(0x04, 0x01); // LOFF: 24nA Current, AC Lead-off at fDR/4 (000 0 01 01)
+    // 手动配置阻抗测试相关的硬件寄存器
+    ADS1299_Write_Reg(0x00, 0x3E); // ID 寄存器 (只读)
+    ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 菊花链禁用，振荡器时钟输出禁用，250 SPS
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: 内部测试信号生成
+    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: 开启内部参考缓冲，VREF = 4.5V
+    ADS1299_Write_Reg(0x04, 0x01); // LOFF: 24nA 电流，交流阻抗脱落检测 (fDR/4)
 
-    // CHnSET: 0x60 = Gain 24, Normal Input; 0x80 = Gain 24, Input Shorted? No, 0x80 is powered down?
-    // Wait, 0x80 = 1000 0000 -> PD=1 (Power Down), GAIN=1 (1), MUX=0 (Normal) -> Power Down
-    // 0x60 = 0110 0000 -> PD=0 (Active), GAIN=24 (110), MUX=0 (Normal)
-    ADS1299_Write_Reg(0x05, 0x60); // CH1: Active, Gain 24, Normal Input
-    ADS1299_Write_Reg(0x06, 0x80); // CH2: Power Down
-    ADS1299_Write_Reg(0x07, 0x80); // CH3: Power Down
-    ADS1299_Write_Reg(0x08, 0x80); // CH4: Power Down
-    ADS1299_Write_Reg(0x09, 0x80); // CH5: Power Down
-    ADS1299_Write_Reg(0x0A, 0x80); // CH6: Power Down
-    ADS1299_Write_Reg(0x0B, 0x80); // CH7: Power Down
-    ADS1299_Write_Reg(0x0C, 0x80); // CH8: Power Down
+    // CHnSET 配置: 0x60 = 24 倍增益正常输入; 0x80 = 通道关断
+    ADS1299_Write_Reg(0x05, 0x60); // CH1: 启用, 增益 24, 正常输入
+    ADS1299_Write_Reg(0x06, 0x80); // CH2: 关断
+    ADS1299_Write_Reg(0x07, 0x80); // CH3: 关断
+    ADS1299_Write_Reg(0x08, 0x80); // CH4: 关断
+    ADS1299_Write_Reg(0x09, 0x80); // CH5: 关断
+    ADS1299_Write_Reg(0x0A, 0x80); // CH6: 关断
+    ADS1299_Write_Reg(0x0B, 0x80); // CH7: 关断
+    ADS1299_Write_Reg(0x0C, 0x80); // CH8: 关断
 
-    ADS1299_Write_Reg(0x0D, 0x00); // BIAS_SENSP
-    ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
-    ADS1299_Write_Reg(0x0F, 0x01); // LOFF_SENSP: LOFF8P? No, 0x01 is LOFF1P enabled
-    ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
-    ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
-    ADS1299_Write_Reg(0x12, 0x00); // LOFF_STATP (RO)
-    ADS1299_Write_Reg(0x13, 0x00); // LOFF_STATN (RO)
+    ADS1299_Write_Reg(0x0D, 0x00); // BIAS_SENSP: 禁用
+    ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN: 禁用
+    ADS1299_Write_Reg(0x0F, 0x01); // LOFF_SENSP: 仅启用 CH1 正极脱落检测
+    ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN: 禁用
+    ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP: 禁用
+    ADS1299_Write_Reg(0x12, 0x00); // LOFF_STATP (只读)
+    ADS1299_Write_Reg(0x13, 0x00); // LOFF_STATN (只读)
     ADS1299_Write_Reg(0x14, 0x00); // GPIO
-    ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1 connected to all N inputs (closed)
+    ADS1299_Write_Reg(0x15, 0x20); // MISC1: 将 SRB1 连接到所有的负极输入 (短接参考)
     ADS1299_Write_Reg(0x16, 0x00); // MISC2
-    ADS1299_Write_Reg(0x17, 0x02); // CONFIG4: PD_LOFF_COMP enabled (Lead-Off Comparator Enabled)
+    ADS1299_Write_Reg(0x17, 0x02); // CONFIG4: 开启 PD_LOFF_COMP 导联脱落硬件比较器
 
     USB_Print("[TEST_IMP] Registers Configured.\r\n");
 		
@@ -2387,7 +2598,10 @@ cmd_response_t cmd_test_imp_handler(char* args) {
 				HAL_Delay(5);
 		}
 
-    // Start Acquisition
+    // 播放提示音 3.wav (开始阻抗检测)
+    Play_System_Audio(3);
+
+    // 启动采集
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
 
@@ -2397,11 +2611,11 @@ cmd_response_t cmd_test_imp_handler(char* args) {
     app_state = APP_IMP_TEST_RUNNING; 
     start_time = HAL_GetTick();
     sample_count = 0;
-    target_samples = 60 * 250; // Run for 1 minute
+    target_samples = 60 * 250; // 测试时长限制为 1 分钟
     last_display_time = start_time;
-    current_channel = 1; // Focus on Channel 1
+    current_channel = 1; // 仅聚焦于通道 1
 
-    // Reset Impedance Stats
+    // 重置阻抗统计参数
     imp_max_val = -1e9;
     imp_min_val = 1e9;
     imp_window_count = 0;
@@ -2412,6 +2626,12 @@ cmd_response_t cmd_test_imp_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 TEST_IMP_ALL 指令，启动全通道 (8CH) 阻抗测量测试
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 与 TEST_IMP 类似，但配置所有通道开启并接入脱落检测网络，并在主循环中上报二进制或文本格式阻抗值
+ */
 cmd_response_t cmd_test_imp_all_handler(char* args) {
     cmd_response_t response = {1, ""};
 
@@ -2424,37 +2644,37 @@ cmd_response_t cmd_test_imp_all_handler(char* args) {
     ADS1299_Stop();
     HAL_Delay(10);
     
-    // Switch to binary protocol mode to send TYPE_IMP packets
+    // 切换为二进制协议模式以发送 TYPE_IMP 数据包
     extern volatile uint8_t g_use_binary_protocol;
     g_use_binary_protocol = 1;
 
-    // Manual Register Configuration for Impedance Test (All Channels)
+    // 手动配置全通道阻抗测试相关的硬件寄存器
     ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
-    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal test signal generation
-    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: Internal reference buffer enabled, VREF = 4.5V
-    ADS1299_Write_Reg(0x04, 0x05); // LOFF: 24nA Current, AC Lead-off at fDR/4 (000 0 01 01)
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: 内部测试信号生成
+    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: 开启内部参考缓冲，VREF = 4.5V
+    ADS1299_Write_Reg(0x04, 0x05); // LOFF: 24nA 电流，交流阻抗脱落检测 (fDR/4)
 
-    // Enable all 8 channels (Gain 24, Normal Input)
+    // 启用所有 8 个通道 (增益 24，正常输入)
     for(int i=1; i<=8; i++) {
         ADS1299_Write_Reg(0x04 + i, 0x60); 
     }
 
     ADS1299_Write_Reg(0x0D, 0x00); // BIAS_SENSP
     ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
-    ADS1299_Write_Reg(0x0F, 0xFF); // LOFF_SENSP: All P inputs enabled for LOFF
+    ADS1299_Write_Reg(0x0F, 0xFF); // LOFF_SENSP: 为所有正极输入启用脱落检测
     ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
     ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
-    ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1 connected to all N inputs
-    ADS1299_Write_Reg(0x17, 0x02); // CONFIG4: PD_LOFF_COMP enabled
+    ADS1299_Write_Reg(0x15, 0x20); // MISC1: 将 SRB1 连接到所有的负极输入
+    ADS1299_Write_Reg(0x17, 0x02); // CONFIG4: 开启 PD_LOFF_COMP 导联脱落硬件比较器
 
     USB_Print("[TEST_IMP_ALL] Registers Configured (8CH).\r\n");
     
-    // Read back and print registers
+    // 读回并打印寄存器配置
     USB_Print("\r\n[BOOT] ADS1299 Registers before START:\r\n");
     uint8_t regs[24];
     ADS1299_Read_Regs(0x00, regs, 24);
     
-    // In binary mode, avoid spamming 24 lines of text which can cause USB buffer overflow
+    // 在二进制模式下，避免打印 24 行文本，这可能导致 USB 缓冲区溢出或上位机解析错误
     extern volatile uint8_t g_use_binary_protocol;
     if (!g_use_binary_protocol) {
         for(int i=0; i<24; i++) {
@@ -2462,11 +2682,14 @@ cmd_response_t cmd_test_imp_all_handler(char* args) {
             HAL_Delay(5);
         }
     } else {
-        // Just print a summary or nothing to prevent blocking the main loop
+        // 仅打印摘要或保持静默以防止阻塞主循环
         USB_Print("Registers dumped (omitted for binary mode).\r\n");
     }
     
-    // Start Acquisition
+    // 播放提示音 3.wav (开始阻抗检测)
+    Play_System_Audio(3);
+    
+    // 启动采集
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
 
@@ -2476,10 +2699,10 @@ cmd_response_t cmd_test_imp_all_handler(char* args) {
     app_state = APP_IMP_TEST_ALL_RUNNING; 
     start_time = HAL_GetTick();
     sample_count = 0;
-    target_samples = 0xFFFFFFFF; // Run indefinitely (until STOP)
+    target_samples = 0xFFFFFFFF; // 无限期运行 (直到接收到 STOP 指令)
     last_display_time = start_time;
 
-    // Reset Impedance Stats
+    // 重置阻抗统计参数
     for(int i=0; i<8; i++) {
         imp_all_max[i] = -1e9;
         imp_all_min[i] = 1e9;
@@ -2490,6 +2713,12 @@ cmd_response_t cmd_test_imp_all_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 TEST_NOISE 指令，启动系统内部本底噪声测试
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 所有通道输入短接，采集 1 秒钟的数据以计算 RMS 噪声和峰峰值
+ */
 cmd_response_t cmd_test_noise_handler(char* args) {
     cmd_response_t response = {1, ""};
     
@@ -2502,19 +2731,19 @@ cmd_response_t cmd_test_noise_handler(char* args) {
     ADS1299_Stop();
     HAL_Delay(10);
 
-    // 1. Configure Registers
-    // 0x00 is Read Only
+    // 1. 配置寄存器
+    // 0x00 为只读
     ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
-    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal Test Signal On
-    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: Ref Buffer Enabled, VRef 4.5V
-    ADS1299_Write_Reg(0x04, 0x00); // LOFF: Disabled
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: 开启内部测试信号
+    ADS1299_Write_Reg(0x03, 0xE6); // CONFIG3: 开启参考缓冲，VRef 4.5V
+    ADS1299_Write_Reg(0x04, 0x00); // LOFF: 禁用
 
-    // CH1-CH8: Gain 24, Input Shorted (0x61)
+    // CH1-CH8: 增益 24，输入短接以测量本底噪声 (0x61)
     for(int i=1; i<=8; i++) {
         ADS1299_Write_Reg(0x04 + i, 0x61); 
     }
     
-    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: All enabled
+    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: 全部启用
     ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
     ADS1299_Write_Reg(0x0F, 0x00); // LOFF_SENSP
     ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
@@ -2528,7 +2757,7 @@ cmd_response_t cmd_test_noise_handler(char* args) {
 
     USB_Print("[TEST_NOISE] Registers Configured.\r\n");
 
-    // 2. Read Back and Print
+    // 2. 读回并打印寄存器
     USB_Print("\r\n[BOOT] ADS1299 Registers after Config:\r\n");
     uint8_t regs[24];
     ADS1299_Read_Regs(0x00, regs, 24);
@@ -2537,7 +2766,7 @@ cmd_response_t cmd_test_noise_handler(char* args) {
         HAL_Delay(5);
     }
 
-    // 3. Init Variables
+    // 3. 初始化变量
     for(int i=0; i<8; i++) {
         noise_sum[i] = 0.0;
         noise_sum_sq[i] = 0.0;
@@ -2545,20 +2774,26 @@ cmd_response_t cmd_test_noise_handler(char* args) {
         noise_max[i] = -1e9;
     }
 
-    // 4. Start Acquisition
+    // 4. 启动采集
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
 
     app_state = APP_NOISE_TEST_RUNNING;
     start_time = HAL_GetTick();
     sample_count = 0;
-    target_samples = 250; // 1 second @ 250SPS
+    target_samples = 250; // 1 秒 @ 250SPS
     last_display_time = start_time;
 
     strcpy(response.message, "OK: TEST_NOISE started (1 sec)");
     return response;
 }
 
+/**
+ * @brief 处理 TEST_CMRR 指令，启动单步共模抑制比测试
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 提示用户输入共模信号，运行 2 秒后计算并打印 CMRR 结果
+ */
 cmd_response_t cmd_test_cmrr_handler(char* args) {
     cmd_response_t response = {1, ""};
     
@@ -2573,19 +2808,19 @@ cmd_response_t cmd_test_cmrr_handler(char* args) {
 
     USB_Print("[TEST_CMRR] Please ensure 2Vpp Common Mode signal is applied to all inputs.\r\n");
 
-    // 1. Configure Registers
-    // 0x00 is Read Only (ID)
+    // 1. 配置寄存器
+    // 0x00 为只读 (ID)
     ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
-    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Int Test Signal ON (Internal)
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: 开启内部测试信号
     ADS1299_Write_Reg(0x03, 0xF6); // CONFIG3: VREF=4.5V, RLDREF_INT=1, PD_RLD=1, RLD_MEAS=1
-    ADS1299_Write_Reg(0x04, 0x00); // LOFF: Disabled
+    ADS1299_Write_Reg(0x04, 0x00); // LOFF: 禁用
 
-    // CH1-CH8: Gain 24, Normal Input (0x60)
+    // CH1-CH8: 增益 24，正常输入 (0x60)
     for(int i=1; i<=8; i++) {
         ADS1299_Write_Reg(0x04 + i, 0x60); 
     }
     
-    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: All enabled
+    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: 全部启用
     ADS1299_Write_Reg(0x0E, 0x00); // BIAS_SENSN
     ADS1299_Write_Reg(0x0F, 0x00); // LOFF_SENSP
     ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
@@ -2599,7 +2834,7 @@ cmd_response_t cmd_test_cmrr_handler(char* args) {
 
     USB_Print("[TEST_CMRR] Registers Configured.\r\n");
 
-    // 2. Read Back and Print
+    // 2. 读回并打印
     USB_Print("\r\n[BOOT] ADS1299 Registers after Config:\r\n");
     uint8_t regs[24];
     ADS1299_Read_Regs(0x00, regs, 24);
@@ -2608,25 +2843,31 @@ cmd_response_t cmd_test_cmrr_handler(char* args) {
         HAL_Delay(5);
     }
 
-    // 3. Init Variables
+    // 3. 初始化变量
     for(int i=0; i<8; i++) {
         cmrr_sum_sq[i] = 0.0;
     }
 
-    // 4. Start Acquisition
+    // 4. 启动采集
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
 
     app_state = APP_CMRR_TEST_RUNNING;
     start_time = HAL_GetTick();
     sample_count = 0;
-    target_samples = 500; // 2 seconds @ 250SPS
+    target_samples = 500; // 2 秒 @ 250SPS
     last_display_time = start_time;
     
     strcpy(response.message, "OK: TEST_CMRR started (2 sec)");
     return response;
 }
 
+/**
+ * @brief 处理 TEST_CMRR_FULL 指令，启动两步法精确共模抑制比测试
+ * @param args 包含当前测试步骤的参数 (STEP1 或 STEP2)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note STEP1 测量差模增益，STEP2 测量共模增益并综合计算最终的 CMRR(dB)
+ */
 cmd_response_t cmd_test_cmrr_full_handler(char* args) {
     cmd_response_t response = {1, ""};
     
@@ -2637,15 +2878,15 @@ cmd_response_t cmd_test_cmrr_full_handler(char* args) {
     }
 
     if (args != NULL && strcmp(args, "STEP1") == 0) {
-        // STEP 1: Differential Gain Test
-        // Requires: 4mV Diff Signal
+        // STEP 1: 差模增益测试
+        // 要求: 输入 4mV 差模信号
         USB_Print("[TEST_CMRR_FULL] STEP 1: Measuring Differential Gain.\r\n");
         USB_Print("Please Apply 4mV (1.414 mVrms) Differential Signal to all channels.\r\n");
 
         ADS1299_Stop();
         HAL_Delay(10);
         
-        // Config for Normal Input (Gain 24)
+        // 配置为正常输入 (增益 24)
         ADS1299_Write_Reg(0x01, 0x96); 
         ADS1299_Write_Reg(0x02, 0xC0); 
         ADS1299_Write_Reg(0x03, 0xF6); 
@@ -2655,9 +2896,9 @@ cmd_response_t cmd_test_cmrr_full_handler(char* args) {
         
         ADS1299_Write_Reg(0x0D, 0xFF); 
         ADS1299_Write_Reg(0x0E, 0x00); 
-        ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1 connected to all N inputs
+        ADS1299_Write_Reg(0x15, 0x20); // MISC1: SRB1 连接到所有负极输入
         
-        // Init Vars
+        // 初始化变量
         for(int i=0; i<8; i++) cmrr_step1_sum_sq[i] = 0.0;
         
         ADS1299_Start();
@@ -2666,20 +2907,20 @@ cmd_response_t cmd_test_cmrr_full_handler(char* args) {
         app_state = APP_CMRR_STEP1_RUNNING;
         start_time = HAL_GetTick();
         sample_count = 0;
-        target_samples = 500; // 2 sec
+        target_samples = 500; // 2 秒
         
         strcpy(response.message, "OK: STEP1 Started");
     } 
     else if (args != NULL && strcmp(args, "STEP2") == 0) {
-        // STEP 2: Common Mode Gain Test
-        // Requires: 2V Comm Signal
+        // STEP 2: 共模增益测试
+        // 要求: 输入 2V 共模信号
         USB_Print("[TEST_CMRR_FULL] STEP 2: Measuring Common Mode Gain.\r\n");
         USB_Print("Please Apply 2V (0.7071 Vrms) Common Mode Signal to all channels.\r\n");
         
         ADS1299_Stop();
         HAL_Delay(10);
         
-        // Same Config
+        // 采用相同配置
         ADS1299_Write_Reg(0x01, 0x96); 
         ADS1299_Write_Reg(0x02, 0xC0); 
         ADS1299_Write_Reg(0x03, 0xF6); 
@@ -2689,7 +2930,7 @@ cmd_response_t cmd_test_cmrr_full_handler(char* args) {
         ADS1299_Write_Reg(0x0E, 0x00); 
         ADS1299_Write_Reg(0x15, 0x20);
 
-        // Init Vars
+        // 初始化变量
         for(int i=0; i<8; i++) cmrr_step2_sum_sq[i] = 0.0;
         
         ADS1299_Start();
@@ -2698,7 +2939,7 @@ cmd_response_t cmd_test_cmrr_full_handler(char* args) {
         app_state = APP_CMRR_STEP2_RUNNING;
         start_time = HAL_GetTick();
         sample_count = 0;
-        target_samples = 500; // 2 sec
+        target_samples = 500; // 2 秒
         
         strcpy(response.message, "OK: STEP2 Started");
     }
@@ -2710,23 +2951,32 @@ cmd_response_t cmd_test_cmrr_full_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 STATE 指令，获取并打印设备当前的综合状态
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 上报 SN 码、版本号、电池电量、USB/SD 状态以及 ADS1299/WM8978 初始化状态
+ */
 cmd_response_t cmd_get_state_handler(char* args) {
     cmd_response_t response = {1, ""};
     (void)args;
 
-    // Update battery voltage reading before reporting
+    // 在上报前更新最新的电池电压读取
     Update_Battery_Voltage();
 
-    // Check ADS1299 ID
+    // 检查 ADS1299 ID
     uint8_t ads_id = ADS1299_ReadRegister(0x00);
-    int ads_ok = ((ads_id & 0x1F) == 0x1E) ? 1 : 0; // ADS1299 ID is typically 0x3E (rev+ID)
+    int ads_ok = ((ads_id & 0x1F) == 0x1E) ? 1 : 0; // ADS1299 ID 通常为 0x3E (rev+ID)
 
-    // Check USB State
+    // 检查 USB 状态
     int usb_ok = (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) ? 1 : 0;
 
+    extern char g_device_sn[];
+    extern const char* g_device_version;
+
     USB_Print("\r\n=== DEVICE STATE REPORT ===\r\n");
-    USB_Print("SN: AIT2601X04566\r\n");
-    USB_Print("VERSION:T1.0.1\r\n");
+    USB_Print("SN: %s\r\n", g_device_sn);
+    USB_Print("VERSION:%s\r\n", g_device_version);
     USB_Print("Battery: %.1f%%\r\n", Battery_Voltage);
     USB_Print("USB:     %s\r\n", usb_ok ? "CONNECTED" : "DISCONNECTED");
     USB_Print("Charging:  %s\r\n", usb_ok ? "CHARGING" : "DISCHARGING");
@@ -2734,15 +2984,18 @@ cmd_response_t cmd_get_state_handler(char* args) {
     USB_Print("ADS1299: %s (ID: 0x%02X)\r\n", ads_ok ? "OK" : "ERROR", ads_id);
     USB_Print("WM8978:  %s\r\n", wm8978_initialized ? "OK" : "ERROR");
     
-    // Detailed ADS1299 Registers (Optional, keep it concise or expand if needed)
-    // For now just ID status is good for "State"
-    
     USB_Print("=== END REPORT ===\r\n");
 
     strcpy(response.message, "OK: State report sent");
     return response;
 }
 
+/**
+ * @brief 处理 PLAYMUSIC 指令，播放指定的音频文件
+ * @param args 包含目标音频文件名的字符串 (可省略 .wav 后缀)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 仅在系统空闲时允许手动触发播放
+ */
 cmd_response_t cmd_playmusic_handler(char* args) {
     cmd_response_t response = {1, ""};
     if (args == NULL || args[0] == '\0') {
@@ -2751,7 +3004,7 @@ cmd_response_t cmd_playmusic_handler(char* args) {
         return response;
     }
     
-    // Check if other app is running
+    // 检查是否处于空闲状态
     if (app_state != APP_IDLE) {
         response.success = 0;
         strcpy(response.message, "ERR: App busy");
@@ -2759,15 +3012,12 @@ cmd_response_t cmd_playmusic_handler(char* args) {
     }
 
     char path[128];
-    // If user provides "1", make it "AUDIO/1.wav"
-    // If user provides "1.wav", make it "AUDIO/1.wav"
-    
-    // Trim spaces
+    // 消除前导空格
     while (*args == ' ') args++;
     
     USB_Print("[CMD] PLAYMUSIC args: '%s'\r\n", args);
 
-    // Construct path
+    // 构建文件路径 (自动补全 .wav)
     if (strstr(args, ".wav") || strstr(args, ".WAV")) {
         sprintf(path, "AUDIO/%s", args);
     } else {
@@ -2776,7 +3026,7 @@ cmd_response_t cmd_playmusic_handler(char* args) {
     
     USB_Print("[CMD] Playing path: '%s'\r\n", path);
 
-    wav_loop_mode = 0; // Play once
+    wav_loop_mode = 0; // 仅播放一次
     
     uint8_t res = Wav_Play(path);
     if (res == 0) {
@@ -2789,10 +3039,15 @@ cmd_response_t cmd_playmusic_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 TEST_RX 指令，测试 USB 接收计数功能
+ * @param args 包含指令参数 (START 或 STOP)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ */
 cmd_response_t cmd_rx_test_handler(char* args) {
     cmd_response_t response = {1, ""};
     
-    // Trim spaces
+    // 消除前导空格
     while (*args == ' ') args++;
     
     if (strcmp(args, "START") == 0 || strcmp(args, "start") == 0) {
@@ -2806,7 +3061,7 @@ cmd_response_t cmd_rx_test_handler(char* args) {
         sprintf(response.message, "RX Test Mode STOPPED. Count: %lu", g_rx_test_count);
     }
     else {
-        // Just report status
+        // 仅报告状态
         sprintf(response.message, "RX Test Mode: %s, Count: %lu", 
                 g_rx_test_mode ? "ON" : "OFF", g_rx_test_count);
     }
@@ -2814,6 +3069,12 @@ cmd_response_t cmd_rx_test_handler(char* args) {
     return response;
 }
 
+/**
+ * @brief 处理 RLD_TEST 指令，测试右腿驱动 (RLD) 抑制效果
+ * @param args 指令参数 (未使用)
+ * @retval cmd_response_t 包含执行结果的响应结构体
+ * @note 将所有通道接入 RLD 偏置网络并运行 10 秒钟以测量本底交流 RMS 值
+ */
 cmd_response_t cmd_rld_test_handler(char* args) {
     cmd_response_t response = {1, ""};
 
@@ -2826,20 +3087,19 @@ cmd_response_t cmd_rld_test_handler(char* args) {
     ADS1299_Stop();
     HAL_Delay(10);
 
-    // Manual Register Configuration for RLD Test as per user request
-    // 0x00 ID (Read Only) - Skipped or verified later
+    // 手动配置寄存器用于 RLD 性能测试
     ADS1299_Write_Reg(0x01, 0x96); // CONFIG1: 250 SPS
-    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: Internal Test Signal On
-    ADS1299_Write_Reg(0x03, 0xEC); // CONFIG3: PD_REFBUF=1, VREF=4V, RLD_MEAS=1, RLDREF_INT=1, PD_RLD=1, RLD_LOFF=0, RLD_STAT=0
-    ADS1299_Write_Reg(0x04, 0x00); // LOFF: Disabled
+    ADS1299_Write_Reg(0x02, 0xC0); // CONFIG2: 内部测试信号开启
+    ADS1299_Write_Reg(0x03, 0xEC); // CONFIG3: PD_REFBUF=1, VREF=4V, RLD_MEAS=1, RLDREF_INT=1, PD_RLD=1
+    ADS1299_Write_Reg(0x04, 0x00); // LOFF: 禁用
 
-    // CHnSET: 0x60 (Gain 24, Normal Input)
+    // CHnSET: 0x60 (增益 24，正常输入)
     for(int i=0; i<8; i++) {
         ADS1299_Write_Reg(0x05 + i, 0x60); 
     }
 
-    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: All channels connected to Bias (RLD)
-    ADS1299_Write_Reg(0x0E, 0xFF); // BIAS_SENSN: All channels connected to Bias (RLD)
+    ADS1299_Write_Reg(0x0D, 0xFF); // BIAS_SENSP: 所有通道均连接到 RLD
+    ADS1299_Write_Reg(0x0E, 0xFF); // BIAS_SENSN: 所有通道均连接到 RLD
     ADS1299_Write_Reg(0x0F, 0x00); // LOFF_SENSP
     ADS1299_Write_Reg(0x10, 0x00); // LOFF_SENSN
     ADS1299_Write_Reg(0x11, 0x00); // LOFF_FLIP
@@ -2852,7 +3112,7 @@ cmd_response_t cmd_rld_test_handler(char* args) {
 
     USB_Print("[RLD_TEST] Registers Configured for RLD Test (10s).\r\n");
     
-    // Read back verification (optional, can be helpful)
+    // 读回以供验证
     USB_Print("[BOOT] ADS1299 Registers:\r\n");
     uint8_t regs[24];
     ADS1299_Read_Regs(0x00, regs, 24);
@@ -2861,7 +3121,7 @@ cmd_response_t cmd_rld_test_handler(char* args) {
         HAL_Delay(2);
     }
 
-    // Initialize stats
+    // 初始化统计变量
     for(int i=0; i<8; i++) {
         rld_sum[i] = 0.0;
         rld_sum_sq[i] = 0.0;
@@ -2873,13 +3133,17 @@ cmd_response_t cmd_rld_test_handler(char* args) {
     app_state = APP_RLD_TEST_RUNNING;
     start_time = HAL_GetTick();
     sample_count = 0;
-    target_samples = 10 * 250; // 10 seconds @ 250 SPS
+    target_samples = 10 * 250; // 10 秒 @ 250 SPS
     last_display_time = start_time;
 
     strcpy(response.message, "OK: RLD_TEST Started. Please wait 10s...");
     return response;
 }
 
+/**
+ * @brief 注册所有的串口与 USB 指令
+ * @note 初始化命令系统并将所有的指令字符串绑定到对应的处理函数
+ */
 void register_all_commands(void) {
   command_system_init();
 
@@ -2895,7 +3159,6 @@ void register_all_commands(void) {
   register_command("AUTO_STREAM", cmd_auto_stream_handler, "AUTO_STREAM:<filename>", "8 channel stream with P-pole lead-off monitoring");
   register_command("STOP", cmd_stop_handler, "STOP", "Stop acquisition");
   register_command("REG", cmd_reg_handler, "REG", "Read ADS1299 registers");
-  register_command("SWEEP", cmd_sweep_handler, "SWEEP", "AD5933 Freq Sweep");
   register_command("TEST_IMP", cmd_test_imp_handler, "TEST_IMP", "Test Impedance Config");
   register_command("TEST_IMP_ALL", cmd_test_imp_all_handler, "TEST_IMP_ALL", "Test Impedance (8CH, 1s log)");
   register_command("TEST_NOISE", cmd_test_noise_handler, "TEST_NOISE", "Internal noise test");

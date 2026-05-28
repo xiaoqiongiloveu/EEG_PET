@@ -35,7 +35,6 @@
 #include "command_system.h"
 #include "commands_impl.h"
 #include "binary_protocol.h" // Added for BP_CMD definitions
-#include "ad5933.h"
 #include "wm8978.h"
 #include "wavplay.h"
 /* USER CODE END Includes */
@@ -115,6 +114,34 @@ uint32_t BackupReg_Read(uint32_t index);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+char g_device_sn[24] = {0};
+const char* g_device_version = "T1.0.3";
+
+/**
+  * @brief  生成动态设备序列号(SN)
+  * @note   通过读取STM32芯片出厂自带的96位UID，进行哈希和取模运算，
+  *         生成一个固定的5位数字尾号，并格式化到全局变量 g_device_sn 中。
+  *         确保每台设备的SN唯一且每次开机保持不变。
+  */
+void Generate_Device_SN(void)
+{
+    uint32_t uid0 = HAL_GetUIDw0();
+    uint32_t uid1 = HAL_GetUIDw1();
+    uint32_t uid2 = HAL_GetUIDw2();
+    // 对96位UID进行简单的异或哈希计算
+    uint32_t uid_hash = uid0 ^ uid1 ^ uid2;
+    // 取模 100000 得到一个5位数字
+    uint32_t sn_digits = uid_hash % 100000;
+    
+    snprintf(g_device_sn, sizeof(g_device_sn), "AIT2601X%05lu", sn_digits);
+}
+
+/**
+  * @brief  EXTI 外部中断回调函数
+  * @param  GPIO_Pin: 触发中断的GPIO引脚号
+  * @note   主要用于捕获 ADS1299 的 DRDY (Data Ready) 数据就绪信号下降沿。
+  *         当引脚匹配时，将调用底层数据处理函数读取脑电数据。
+  */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if(GPIO_Pin == ADS1299_DRDY_Pin)
@@ -123,11 +150,17 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 }
 
+/**
+  * @brief  SD卡初始化与挂载处理流程
+  * @note   该函数负责初始化FatFs文件系统、挂载SD卡，并执行一次基础的文件读写测试。
+  *         同时，它还会检查并清理遗留的OTA升级文件(update.bin)，防止设备陷入无限升级循环。
+  *         如果挂载失败，将通过音频系统播报设备错误提示音。
+  */
 void SD_Init_Process(void)
 {
-    // 1. Mount File System
+    // 1. 挂载文件系统
     USB_Print("[SD] Mounting FS... (ClockDiv: %d)\r\n", hsd1.Init.ClockDiv);
-    // Retry mount up to 3 times
+    // 尝试挂载最多3次
     for(int i=0; i<3; i++) {
         res = f_mount(&SDFatFS, SDPath, 1);
         if(res == FR_OK) break;
@@ -138,12 +171,13 @@ void SD_Init_Process(void)
     if(res != FR_OK)
     {
         USB_Print("[SD] Mount Failed! Error: %d\r\n", res);
+        Play_System_Audio(16); // DEVICE_ERROR
         return;
     }
     USB_Print("[SD] Mount Success!\r\n");
     sd_mounted = 1;
 
-    // 2. Test Write
+    // 2. 测试写操作
     USB_Print("[SD] Testing Write to '2025.txt'...\r\n");
     res = f_open(&SDFile, "2025.txt", FA_CREATE_ALWAYS | FA_WRITE);
     if(res != FR_OK) {
@@ -161,7 +195,7 @@ void SD_Init_Process(void)
     }
     USB_Print("[SD] Written %d bytes.\r\n", bytes_written);
     
-    // Explicitly sync the file buffer to physical disk
+    // 强制同步文件缓冲区到物理磁盘
     res = f_sync(&SDFile);
     if(res != FR_OK) {
         USB_Print("[SD] Sync Failed! Error: %d\r\n", res);
@@ -169,7 +203,7 @@ void SD_Init_Process(void)
 
     f_close(&SDFile);
 
-    // 3. Test Read
+    // 3. 测试读操作
     USB_Print("[SD] Testing Read from '2025.txt'...\r\n");
     res = f_open(&SDFile, "2025.txt", FA_READ);
     if(res != FR_OK) {
@@ -190,73 +224,89 @@ void SD_Init_Process(void)
     
     USB_Print("[SD] Test Complete.\r\n");
     
-    // 4. Clean up OTA firmware file to prevent re-flashing loop
+    // 4. 清理旧的OTA固件文件，防止开机陷入无限刷机循环
     FILINFO fno_ota;
     if (f_stat("update.bin", &fno_ota) == FR_OK) {
         USB_Print("[BOOT] Found old update.bin, deleting...\r\n");
         f_unlink("update.bin");
         USB_Print("[BOOT] update.bin deleted.\r\n");
     }
-
-    // Prepare data.bin for logging (optional, if we were logging)
-    // res = f_open(&SDFile, "data.bin", FA_OPEN_APPEND | FA_WRITE);
-    // if(res == FR_OK) file_opened = 1;
 }
 
+/**
+  * @brief  板级支持包(BSP)初始化
+  * @note   负责初始化系统基础电源控制引脚，并配置软件I2C（用于传感器通信）。
+  *         该函数必须在其他外设初始化之前调用。
+  */
 void User_BSP_Init(void)
 {
-    // 1. Power Control (Must be first)
+    // 1. 电源控制初始化 (必须最先执行，防止断电)
     Power_Control_Init();
     
-    // 2. Soft I2C for Sensors
+    // 2. 软件I2C初始化 (目前暂无挂载的传感器，保留接口)
     Soft_I2C_Init();
 }
 
+/**
+  * @brief  核心业务外设与传感器初始化
+  * @note   按顺序初始化系统的核心硬件外设，包括：
+  *         1. 环形缓冲区 (用于EEG数据中转)
+  *         2. ADS1299 高精度脑电ADC芯片
+  *         3. QMI8658 六轴姿态传感器
+  *         4. SD卡与FatFs文件系统
+  *         5. WM8978 音频编解码芯片 (配置为DAC耳机输出模式)
+  *         若关键芯片初始化失败，将触发错误报警音。
+  */
 void User_Device_Init(void)
 {
-    // 1. Initialize Circular Buffer (Required for ADS1299)
+    // 1. 初始化环形缓冲区 (接收ADS1299数据必备)
     circular_buffer_init(&ADS1299_circula_buffer, CIRCULAR_BUFFER_MAX_SIZE);
 
-    // 2. ADS1299 EEG AFE Init
+    // 2. 初始化 ADS1299 脑电模拟前端
     USB_Print("[BOOT] Initializing ADS1299...\r\n");
     ADS1299_Init();
+    uint8_t ads_id = ADS1299_ReadRegister(0x00);
+    if ((ads_id & 0x1F) != 0x1E) {
+        Play_System_Audio(16); // DEVICE_ERROR
+    }
     
-    // 3. QMI8658 IMU Init
+    // 3. 初始化 QMI8658 六轴姿态传感器
     USB_Print("[BOOT] Initializing QMI8658...\r\n");
     if (QMI8658_Init() == 0) {
         USB_Print("[BOOT] QMI8658 Init Success (ID=0x05)\r\n");
     } else {
         USB_Print("[BOOT] QMI8658 Init Failed!\r\n");
+        Play_System_Audio(16); // DEVICE_ERROR
     }
     
-    // 4. SD Card Init//
+    // 4. 初始化 SD卡 与 FatFs
     USB_Print("[BOOT] Initializing SD Card...\r\n");
     SD_Init_Process(); 
 
-    // 5. WM8978 Audio Codec Init
+    // 5. 初始化 WM8978 音频编解码器
     USB_Print("[BOOT] Initializing WM8978...\r\n");
     if (WM8978_Init() == 0) {
         wm8978_initialized = 1;
         USB_Print("[BOOT] WM8978 Init Success!\r\n");
         
-        // Basic Config for DAC output (Headphones)
-        WM8978_ADDA_Cfg(1, 0);      // Enable DAC, Disable ADC
-        WM8978_Write_Reg(11, 0xFF); // Digital Volume Max
+        // 为耳机输出配置基础DAC参数
+        WM8978_ADDA_Cfg(1, 0);      // 开启 DAC, 关闭 ADC
+        WM8978_Write_Reg(11, 0xFF); // 设置数字音量最大
         
-        // Speaker Boost Removed for Headphone Mode
-        // uint16_t r49 = WM8978_Read_Reg(49);
-        // WM8978_Write_Reg(49, r49 | (1 << 2)); 
-
-        WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
-        WM8978_Output_Cfg(1, 0);    // Enable DAC Output
-        WM8978_HPvol_Set(63, 63);   // Headphone Volume (Max 63)
-        WM8978_SPKvol_Set(63);      // Speaker Volume (Max 63)
+        WM8978_Input_Cfg(0, 0, 0);  // 关闭所有输入通道
+        WM8978_Output_Cfg(1, 0);    // 开启 DAC 输出
+        WM8978_HPvol_Set(63, 63);   // 耳机音量设置为最大 (63)
+        WM8978_SPKvol_Set(63);      // 喇叭音量设置为最大 (63)
     } else {
         wm8978_initialized = 0;
         USB_Print("[BOOT] WM8978 Init Failed!\r\n");
     }
 }
 
+/**
+  * @brief  应用层逻辑初始化
+  * @note   注册系统所有支持的命令行(CLI)与二进制指令，绑定对应的回调处理函数。
+  */
 void User_App_Init(void)
 {
     // Register CLI Commands
@@ -265,8 +315,10 @@ void User_App_Init(void)
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
+  * @brief  主程序入口 (Main Loop)
+  * @retval int 程序的退出状态 (嵌入式系统中通常不会返回)
+  * @note   系统启动的总控流程，包含底层硬件配置、看门狗初始化、热启动任务恢复逻辑，
+  *         以及死循环中的设备状态轮询、USB指令解析、音频状态机刷新等。
   */
 int main(void)
 {
@@ -274,26 +326,26 @@ int main(void)
   /* USER CODE BEGIN 4 */
 /* USER CODE END 4 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+  /* 芯片配置 --------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  // 1. Disable Interrupts (Safety measure)
+  /* 重置所有外设，初始化Flash接口和Systick。 */
+  // 1. 关闭所有中断 (出于安全考虑，防止初始化过程中被打断)
   __disable_irq();
 
-  // 3. De-init RCC (Reset Clock to default)
+  // 3. 复位RCC (将时钟重置为默认状态)
   HAL_RCC_DeInit();
   
-  // 3.1 Force Vector Table Offset (Critical for Bootloader Jump)
+  // 3.1 强制设置中断向量表偏移 (这对于Bootloader跳转启动至关重要)
   SCB->VTOR = FLASH_BASE | 0x8000;
 
-  // 4. Init HAL (Configures SysTick, etc.)
+  // 4. 初始化HAL库 (配置SysTick滴答定时器等)
   HAL_Init();
   
-  // CRITICAL: Kick Watchdog immediately
+  // CRITICAL: 立即喂狗 (防止看门狗超时复位)
   IWDG->KR = 0xAAAA;
   
-  // CRITICAL: Lock Power ON immediately (Software Power Latch)
-  // Enable GPIOA Clock first (in case it was disabled)
+  // CRITICAL: 立即锁定电源保持开启 (软件电源自锁机制)
+  // 首先使能GPIOA时钟 (以防其未开启)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   GPIO_InitStruct.Pin = POWER_CTRL_Pin;
@@ -303,23 +355,23 @@ int main(void)
   HAL_GPIO_Init(POWER_CTRL_GPIO_Port, &GPIO_InitStruct);
   HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_SET);
   
-  // 5. Re-enable Interrupts
+  // 5. 重新开启全局中断
   __enable_irq();
 
   /* USER CODE BEGIN Init */
   /* USER CODE END Init */
 
-  /* Configure the system clock */
+  /* 配置系统时钟 */
   SystemClock_Config();
 
-  /* Configure the peripherals common clocks */
+  /* 配置外设的公共时钟 */
   PeriphCommonClock_Config();
 
   /* USER CODE BEGIN SysInit */
   Delay_Init();
 /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
+  /* 初始化所有已配置的外设 */
   MX_GPIO_Init();
   
   MX_DMA_Init();
@@ -335,25 +387,29 @@ int main(void)
   // 0. RGB LED 硬件引脚初始化
   RGB_LED_Init();
 
-  // 1. BSP Init (Power, Soft I2C)
+  // 1. BSP 板级基础初始化 (电源控制、软件I2C)
   User_BSP_Init();
 
-  // 2. Device Init (ADS1299, QMI8658, AD5933)
+  // 2. 核心业务外设与传感器初始化 (ADS1299, QMI8658, SD, Audio)
   User_Device_Init();
+  
+  // --- 开机仅执行一次：基于MCU UID生成唯一的动态SN码 ---
+  Generate_Device_SN();
+  // -------------------------------------------------
 
-  // 3. App Init (CLI, Buffers)
+  // 3. 应用层初始化 (注册CLI命令行与协议缓存)
   User_App_Init();
 
-  // 4. Hot-Start Task Recovery (Resume from reset)
+  // 4. 热启动任务恢复逻辑 (应对死机复位后的无缝恢复)
   if (BackupReg_Read(BKP_REG_MAGIC) == BKP_MAGIC_NUMBER) {
       uint32_t last_state = BackupReg_Read(BKP_REG_TASK_STATE);
       uint32_t last_id = BackupReg_Read(BKP_REG_TASK_ID);
       
-      if (last_state == 2) { // 2 = RUNNING
+      if (last_state == 2) { // 2 = 任务正在运行 (RUNNING)
           extern volatile uint8_t g_task_state;
           extern uint32_t g_task_id;
           g_task_id = last_id;
-          g_task_state = 2; // Immediately set to running
+          g_task_state = 2; // 立即将状态机切回运行态
           
           char filename[32];
           snprintf(filename, sizeof(filename), "T_%lu.BIN", g_task_id);
@@ -362,40 +418,38 @@ int main(void)
           g_use_binary_protocol = 1;
           
           extern cmd_response_t cmd_stream_handler(char*);
-          cmd_stream_handler(filename); // Resume recording
+          cmd_stream_handler(filename); // 恢复底层记录流
           USB_Print("[BOOT] Hot Start: Resuming Task %lu\r\n", g_task_id);
       }
   }
 
-  // 5. Start Watchdog (4.0s timeout)
+  // 5. 启动独立看门狗 (4.0秒超时限制)
   MX_IWDG_Init();
   USB_Print("[BOOT] Watchdog Enabled. System Ready.\r\n");
   
-  // Check if device is disabled via SD card flag
+  // 检查是否通过SD卡标识文件禁用了设备
   {
       extern FIL SDFile;
-      // Close any potentially opened file first just in case
+      // 以防万一，先强制关闭可能已打开的文件句柄
       f_close(&SDFile); 
       if (f_open(&SDFile, "disabled.bin", FA_READ) == FR_OK) {
           f_close(&SDFile);
           extern volatile uint8_t g_task_state;
-          g_task_state = 99; // Set device to disabled state immediately on boot
+          g_task_state = 99; // 启动时立即将设备置为禁用状态 (99)
       }
   }
   
   USB_Print("\r\n=================================\r\n");
-  USB_Print("   APP FIRMWARE VERSION: T1.0.1   \r\n");
+  USB_Print("   APP FIRMWARE VERSION: %s   \r\n", g_device_version);
+  USB_Print("   DEVICE SN: %s              \r\n", g_device_sn);
   USB_Print("=================================\r\n");
   
-  // Play 1.wav after init
-  Wav_Play("AUDIO/1.wav");
-  while(is_playing) {
-      Wav_Process();
-  }
+  // 初始化完成后，播放开机欢迎语音 (DEVICE_BOOT, ID: 1)
+  Play_System_Audio(1);
   
   /* USER CODE END 2 */
 
-  /* Infinite loop */
+  /* 无限循环 */
   /* USER CODE BEGIN WHILE */
   
   // 初始化默认状态：开机默认蓝灯中速闪烁
@@ -403,7 +457,7 @@ int main(void)
   
   while (1)
   {
-    IWDG->KR = 0xAAAA; // Feed Dog
+    IWDG->KR = 0xAAAA; // 喂狗操作
     
     // --- 处理 RGB 三色灯的非阻塞状态机 ---
     RGB_LED_Process();
@@ -411,24 +465,25 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    // 1. 处理通过USB接收到的串口命令
     if (usb_cmd_ready) {
         usb_cmd_ready = 0;
         process_command_ex(usb_cmd_buffer);
     }
 
-    // Process OTA Buffer (Write to SD Card)
+    // 2. 处理OTA升级缓冲区 (将固件数据写入SD卡)
     extern void process_ota_data(void);
     process_ota_data();
 
-    // Check for pending Binary Protocol Commands (Deferred from USB Interrupt)
+    // 3. 处理挂起的二进制协议指令 (从USB中断中延期处理，避免在中断中耗时)
      extern volatile uint8_t g_pending_binary_cmd;
-     extern char g_pending_filename[]; // Defined in command_system.c
+     extern char g_pending_filename[]; // 定义在 command_system.c
      extern uint32_t g_pending_ota_size;
-     extern uint32_t g_pending_ota_crc; // Added CRC
+     extern uint32_t g_pending_ota_crc; // 增加CRC校验
 
      if (g_pending_binary_cmd != 0) {
          uint8_t cmd = g_pending_binary_cmd;
-         g_pending_binary_cmd = 0; // Clear flag
+         g_pending_binary_cmd = 0; // 清除标志位
         
         if (cmd == BP_CMD_START_STREAM) {
              extern volatile uint8_t g_use_binary_protocol;
@@ -437,74 +492,94 @@ int main(void)
              cmd_stream_handler(NULL);
         }
         else if (cmd == BP_CMD_GET_STATE) {
-             // Construct Status Packet: DeviceType(1) QMI(1) SD(1) BAT(2) DeviceState(1) TaskID(4) Ver(N) + '\0' + SN(N)
+             // 构造状态包: DeviceType(1) QMI(1) SD(1) BAT(2) DeviceState(1) TaskID(4) Ver(N) + '\0' + SN(N)
              uint8_t status_payload[64];
-             status_payload[0] = 1; // Device Type: 1 = 小神探 (XiaoShenTan), 0 = 健脑师 (JianNaoShi)
-             status_payload[1] = 1; // QMI OK
-             status_payload[2] = 1; // SD OK
-             uint16_t bat_mv = 415; // 4.15V (Mocked, should be replaced with real ADC read)
+             status_payload[0] = 1; // 设备类型: 1 = 小神探 (XiaoShenTan), 0 = 健脑师 (JianNaoShi)
+             status_payload[1] = 1; // QMI 状态正常
+             status_payload[2] = 1; // SD卡 状态正常
+             uint16_t bat_mv = 415; // 4.15V (模拟值，应当替换为真实的ADC读取值)
              status_payload[3] = bat_mv & 0xFF;
              status_payload[4] = (bat_mv >> 8) & 0xFF;
              
              extern volatile uint8_t g_task_state;
              extern uint32_t g_task_id;
              extern volatile uint8_t g_usb_host_connected;
+             static uint8_t last_usb_state = 0;
              
              uint8_t dev_state = 0;
              
-             // State Logic Evaluation
+             // 状态逻辑判定
              if (g_usb_host_connected == 0) {
                  dev_state = 4; // 未连接 (闲置的小神探端口)
+                 last_usb_state = 0;
              } 
              else if (g_task_state == 1 || g_task_state == 2) {
                  dev_state = 3; // 进行中 (包括任务倒计时和进行中)
+                 
+                 // 如果在任务进行中刚刚建立连接，播放连接成功提示音
+                 if (!last_usb_state) {
+                     last_usb_state = 1;
+                     Play_System_Audio(2);
+                 }
              } 
-             else if (g_task_state == 99) { // Assuming 99 is a special flag for "Disabled", or we handle 0x0C later
+             else if (g_task_state == 99) { // 假设99是一个特殊的“已停用”标志位
                  dev_state = 5; // 已停用
+                 
+                 // 如果刚刚建立连接，播放连接成功提示音
+                 if (!last_usb_state) {
+                     last_usb_state = 1;
+                     Play_System_Audio(2);
+                 }
              } 
              else {
-                 // Connected and Idle
-                 if (bat_mv >= 360) { // Assume >3.6V is >60% (just a rough mock threshold, adjust as needed)
+                 // 已连接且处于空闲状态
+                 if (bat_mv >= 360) { // 假设大于3.6V电量充足 (>60%，根据需要调整阈值)
                      dev_state = 1; // 已就绪 (已连接，电量>60%)
                  } else {
                      dev_state = 2; // 电量低 (已连接，电量<60%)
+                 }
+                 
+                 // 如果刚刚建立连接，播放连接成功提示音
+                 if (!last_usb_state) {
+                     last_usb_state = 1;
+                     Play_System_Audio(2);
                  }
              }
              
              status_payload[5] = dev_state;
              memcpy(&status_payload[6], &g_task_id, 4);
              
-             const char* ver = "T1.0.3";
-             const char* sn = "AIT2601X04567";
+             const char* ver = g_device_version;
+             const char* sn = g_device_sn;
              
              int offset = 10;
              strcpy((char*)&status_payload[offset], ver);
-             offset += strlen(ver) + 1; // Include null terminator separator
+             offset += strlen(ver) + 1; // 包含 null 终止符作为分隔
              
              strcpy((char*)&status_payload[offset], sn);
-             offset += strlen(sn); // No need for null terminator at the very end
+             offset += strlen(sn); // 最后一个字符串不需要加 null 终止符
              
              uint8_t tx_buf[128];
-             uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_STATUS, 0, status_payload, offset); // Note: Seq is 0 here since it's asynchronous
+             uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_STATUS, 0, status_payload, offset); // 注意：此处是异步发送，Seq固定为0
              CDC_Transmit_FS(tx_buf, tx_len);
              
-             // Audio Output Switching Logic based on PB3 Level Transition
+             // 基于PB3电平跳变的音频输出切换逻辑
              uint8_t current_pb3 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3);
-             static uint8_t last_pb3_state = 0xFF; // Static to persist across calls
+             static uint8_t last_pb3_state = 0xFF; // 静态变量，跨函数调用保持状态
               if (current_pb3 != last_pb3_state) {
-                  // Re-run full initialization sequence to ensure signal path is fully restored
+                  // 重新运行完整的初始化序列以确保信号路径完全恢复
                   if (WM8978_Init() == 0) {
-                      WM8978_ADDA_Cfg(1, 0);      // Enable DAC, Disable ADC
-                      WM8978_Write_Reg(11, 0xFF); // Digital Volume Max
-                      WM8978_Input_Cfg(0, 0, 0);  // Disable Inputs
-                      WM8978_Output_Cfg(1, 0);    // Enable DAC Output
+                      WM8978_ADDA_Cfg(1, 0);      // 开启 DAC, 关闭 ADC
+                      WM8978_Write_Reg(11, 0xFF); // 数字音量最大
+                      WM8978_Input_Cfg(0, 0, 0);  // 关闭所有输入
+                      WM8978_Output_Cfg(1, 0);    // 开启 DAC 输出
                       
-                      if (current_pb3 == 0) { // Low = Speaker (Unplugged or Reversed logic)
-                           WM8978_HPvol_Set(0, 0);    // Mute Headphone
-                           WM8978_SPKvol_Set(63);     // Max Volume (0-63 range)
-                       } else { // High = Headphone (Plugged in or Reversed logic)
-                           WM8978_HPvol_Set(63, 63); // Max Volume (0-63 range)
-                           WM8978_SPKvol_Set(0);      // Mute Speaker
+                      if (current_pb3 == 0) { // 低电平 = 喇叭 (未插入耳机 或 硬件反相逻辑)
+                           WM8978_HPvol_Set(0, 0);    // 静音耳机
+                           WM8978_SPKvol_Set(63);     // 喇叭音量最大 (0-63 范围)
+                       } else { // 高电平 = 耳机 (已插入耳机 或 硬件反相逻辑)
+                           WM8978_HPvol_Set(63, 63); // 耳机音量最大 (0-63 范围)
+                           WM8978_SPKvol_Set(0);      // 静音喇叭
                        }
                   }
                   last_pb3_state = current_pb3;
@@ -515,15 +590,15 @@ int main(void)
              cmd_stop_handler(NULL);
         }
         else if (cmd == BP_CMD_TEST_IMP) {
-            // Impedance Test command (0x0E)
+            // 阻抗测试指令 (0x0E)
             extern cmd_response_t cmd_test_imp_all_handler(char* args);
             cmd_response_t resp = cmd_test_imp_all_handler(NULL);
             BP_SendResponse(BP_CMD_TEST_IMP, resp.success ? BP_RESP_OK : BP_RESP_ERR, resp.message);
         }
         else if (cmd == BP_CMD_DISABLE_DEVICE) {
-            // Write a "disabled.bin" file to SD card
+            // 在SD卡中写入一个 "disabled.bin" 停用标志文件
             extern FIL SDFile;
-            // Force close any existing open file to prevent FR_DENIED (6)
+            // 强制关闭任何可能已经打开的文件，防止出现 FR_DENIED (6) 错误
             f_close(&SDFile);
             
             FRESULT fr = f_open(&SDFile, "disabled.bin", FA_CREATE_ALWAYS | FA_WRITE);
@@ -531,27 +606,27 @@ int main(void)
                 uint8_t dummy = 1;
                 UINT bw;
                 f_write(&SDFile, &dummy, 1, &bw);
-                // Ensure data is written to disk
+                // 确保数据落盘
                 f_sync(&SDFile);
                 f_close(&SDFile);
                 extern volatile uint8_t g_task_state;
-                g_task_state = 99; // Set device to disabled state immediately
+                g_task_state = 99; // 立即将设备置为已停用状态
                 BP_SendResponse(BP_CMD_DISABLE_DEVICE, BP_RESP_OK, "Device Disabled");
             } else {
-                // Formatting the error code into the string to help debugging
+                // 将错误码格式化到字符串中以帮助调试
                 char err_msg[32];
                 snprintf(err_msg, sizeof(err_msg), "SD Write Failed (%d)", fr);
                 BP_SendResponse(BP_CMD_DISABLE_DEVICE, BP_RESP_ERR, err_msg);
             }
         }
         else if (cmd == BP_CMD_ENABLE_DEVICE) {
-            // Delete the "disabled.bin" file from SD card
+            // 从SD卡中删除 "disabled.bin" 停用标志文件
             extern FIL SDFile;
-            f_close(&SDFile); // Force close
+            f_close(&SDFile); // 强制关闭句柄
             
             if (f_unlink("disabled.bin") == FR_OK) {
                 extern volatile uint8_t g_task_state;
-                if (g_task_state == 99) g_task_state = 0; // Clear disabled state
+                if (g_task_state == 99) g_task_state = 0; // 清除停用状态
                 BP_SendResponse(BP_CMD_ENABLE_DEVICE, BP_RESP_OK, "Device Enabled");
             } else {
                 BP_SendResponse(BP_CMD_ENABLE_DEVICE, BP_RESP_ERR, "SD Unlink Failed or File Not Found");
@@ -561,48 +636,48 @@ int main(void)
              extern volatile uint8_t g_use_binary_protocol;
              g_use_binary_protocol = 1;
              extern cmd_response_t cmd_auto_stream_handler(char*);
-             // Default to "EEG_DATA.TXT" if no args
+             // 如果没有参数，默认使用 "EEG_DATA.TXT"
              cmd_auto_stream_handler("EEG_DATA.TXT");
         }
         else if (cmd == BP_CMD_AUDIO_ROUTE) {
              extern volatile uint8_t g_audio_route;
-             if (g_audio_route == 0) { // Both
+             if (g_audio_route == 0) { // 喇叭和耳机同时输出
                  WM8978_SPKvol_Set(63);
                  WM8978_HPvol_Set(63, 63);
-             } else if (g_audio_route == 1) { // Speaker only
-                 WM8978_HPvol_Set(0, 0); // Mute HP
-                 WM8978_SPKvol_Set(63);  // Unmute SPK
-             } else if (g_audio_route == 2) { // Headphone only
-                 WM8978_SPKvol_Set(0);   // Mute SPK
-                 WM8978_HPvol_Set(63, 63); // Unmute HP
+             } else if (g_audio_route == 1) { // 仅喇叭输出
+                 WM8978_HPvol_Set(0, 0); // 静音耳机
+                 WM8978_SPKvol_Set(63);  // 取消喇叭静音
+             } else if (g_audio_route == 2) { // 仅耳机输出
+                 WM8978_SPKvol_Set(0);   // 静音喇叭
+                 WM8978_HPvol_Set(63, 63); // 取消耳机静音
              }
         }
         else if (cmd == BP_CMD_LIST_FILES) {
-             // List files
+             // 列出文件
              DIR dir;
              FILINFO fno;
              FRESULT fr = f_opendir(&dir, "/");
              if (fr == FR_OK) {
-                 char file_list[512] = {0}; // Max buffer
+                 char file_list[512] = {0}; // 最大缓冲区
                  int offset = 0;
                  for (;;) {
                      fr = f_readdir(&dir, &fno);
                      if (fr != FR_OK || fno.fname[0] == 0) break;
-                     if (fno.fattrib & AM_DIR) continue; // Skip directories
+                     if (fno.fattrib & AM_DIR) continue; // 跳过目录
                      
-                     // Format: Name|Size;
+                     // 格式化为: 文件名|大小;
                      int len = snprintf(file_list + offset, sizeof(file_list) - offset, "%s|%lu;", fno.fname, fno.fsize);
                      if (len > 0) offset += len;
-                     if (offset >= sizeof(file_list) - 32) break; // Avoid overflow
+                     if (offset >= sizeof(file_list) - 32) break; // 防止缓冲区溢出
                  }
                  f_closedir(&dir);
                  
-                 // Send Response with File List
+                 // 发送包含文件列表的响应
                  uint8_t tx_buf[544];
                  uint8_t payload[512];
                  payload[0] = BP_CMD_LIST_FILES;
                  payload[1] = BP_RESP_OK;
-                 if (offset > 508) offset = 508; // Safe cap
+                 if (offset > 508) offset = 508; // 安全上限
                  memcpy(&payload[2], file_list, offset);
                  
                  uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, payload, 2 + offset);
@@ -636,28 +711,28 @@ int main(void)
                      for (;;) {
                          fr = f_readdir(&dir, &fno);
                          if (fr != FR_OK || fno.fname[0] == 0) break;
-                         if (fno.fattrib & AM_DIR) continue; // Skip directories
+                         if (fno.fattrib & AM_DIR) continue; // 跳过目录
                          
-                         // Check if it's a target file (.BIN or .TXT)
+                         // 检查是否为目标文件 (.BIN 或 .TXT)
                          if (strstr(fno.fname, ".BIN") != NULL || strstr(fno.fname, ".TXT") != NULL ||
                              strstr(fno.fname, ".bin") != NULL || strstr(fno.fname, ".txt") != NULL) {
                              
-                             // Exclude protected files
+                             // 排除受保护的文件
                               if (strcmp(fno.fname, "update.bin") != 0 && strcmp(fno.fname, "UPDATE.BIN") != 0 &&
                                   strcmp(fno.fname, "disabled.bin") != 0 && strcmp(fno.fname, "DISABLED.BIN") != 0) {
                                  
-                                 // We only delete one file per directory pass to be safe with FatFs
+                                 // 为了FatFs的安全性，每次遍历目录只删除一个文件
                                  if (f_unlink(fno.fname) == FR_OK) {
                                      deleted_count++;
                                      deleted_in_pass++;
-                                     break; // Break the readdir loop, restart opendir
+                                     break; // 打破 readdir 循环，重新执行 opendir
                                  }
                              }
                          }
                      }
                      f_closedir(&dir);
                  } else {
-                     break; // opendir failed
+                     break; // opendir 失败
                  }
              } while (deleted_in_pass > 0);
              
@@ -669,6 +744,21 @@ int main(void)
                  BP_SendResponse(BP_CMD_CLEAR_DATA, BP_RESP_ERR, "Clear Failed");
              }
         }
+        else if (cmd == BP_CMD_PAUSE) {
+             extern cmd_response_t cmd_pause_handler(char*);
+             cmd_response_t resp = cmd_pause_handler(NULL);
+             BP_SendResponse(BP_CMD_PAUSE, resp.success ? BP_RESP_OK : BP_RESP_ERR, resp.message);
+        }
+        else if (cmd == BP_CMD_RESUME) {
+             extern cmd_response_t cmd_resume_handler(char*);
+             cmd_response_t resp = cmd_resume_handler(NULL);
+             BP_SendResponse(BP_CMD_RESUME, resp.success ? BP_RESP_OK : BP_RESP_ERR, resp.message);
+        }
+        else if (cmd == BP_CMD_STOP_IMP) {
+             extern cmd_response_t cmd_stop_imp_handler(char*);
+             cmd_response_t resp = cmd_stop_imp_handler(NULL);
+             BP_SendResponse(BP_CMD_STOP_IMP, resp.success ? BP_RESP_OK : BP_RESP_ERR, resp.message);
+        }
         else if (cmd == BP_CMD_GET_FILE) {
              extern FIL SDFile;
              FRESULT fr = f_open(&SDFile, g_pending_filename, FA_READ);
@@ -678,44 +768,36 @@ int main(void)
                  uint8_t read_buf[256]; // Chunk size
                  UINT br;
                  
-                 // Send Start Packet: CMD_RESP with size
+                 // 发送起始包: 包含文件大小的 CMD_RESP
                  char start_msg[64];
                  snprintf(start_msg, sizeof(start_msg), "SIZE:%lu", total_size);
                  BP_SendResponse(BP_CMD_GET_FILE, BP_RESP_OK, start_msg);
                  
-                 // Stream Data
+                 // 流式传输数据
                  uint16_t seq = 0;
                  while (sent_bytes < total_size) {
-                     IWDG->KR = 0xAAAA; // Feed Dog to prevent watchdog reset during large file transfer
-                     RGB_LED_Process(); // Keep LED responsive during file transfer
+                     IWDG->KR = 0xAAAA; // 喂狗，防止大文件传输时看门狗复位
+                     RGB_LED_Process(); // 保持传输期间LED状态机的响应
                      
                      fr = f_read(&SDFile, read_buf, sizeof(read_buf), &br);
                      if (fr != FR_OK || br == 0) break;
                      
-                     // Send Data Packet (Type = BP_TYPE_FILE = 0x20 used for OTA, maybe reuse or new type?)
-                     // Let's use BP_TYPE_CMD_RESP with a special status or just raw payload?
-                     // Better: Use a dedicated Type for File Data to avoid confusion.
-                     // Let's use BP_TYPE_OTA (0x20) as "File Transfer" type for now, or add BP_TYPE_FILE_DATA
-                     // Actually, host expects CMD_RESP for handshake, then raw data?
-                     // Let's pack it as BP_TYPE_CMD_RESP with a specific structure? No, overhead.
-                     // Use BP_TYPE_OTA (0x20) for generic file data.
-                     
+                     // 发送数据包
+                     // 暂时使用 BP_TYPE_OTA (0x20) 作为通用文件数据传输类型
                      uint8_t tx_buf[300];
-                      uint16_t tx_len = BP_Pack(tx_buf, 0x20, seq++, read_buf, br); // 0x20 = OTA/File Type
+                      uint16_t tx_len = BP_Pack(tx_buf, 0x20, seq++, read_buf, br); // 0x20 = OTA/文件类型
                       
                       uint8_t res = CDC_Transmit_FS(tx_buf, tx_len);
                       if (res == USBD_BUSY) {
-                          HAL_Delay(2); // Wait a bit
+                          HAL_Delay(2); // 稍作等待
                           res = CDC_Transmit_FS(tx_buf, tx_len);
                       }
                       
                       sent_bytes += br;
-                     // Flow control delay?
-                     // HAL_Delay(1); 
                  }
                  f_close(&SDFile);
                  
-                 // Send End Packet
+                 // 发送结束包
                  BP_SendResponse(BP_CMD_GET_FILE, BP_RESP_OK, "EOF");
                  
              } else {
@@ -724,52 +806,50 @@ int main(void)
          }
      }
     
-    // --- Restored Logic from Original Main ---
-    // Handle Audio (if needed in loop context, though app_run_loop handles it)
+    // --- 恢复原有 Main 函数中的逻辑 ---
+    // 处理音频播放状态机
     extern void Wav_Process(void);
     Wav_Process(); 
     
-    // Handle Power Off Check
+    // 检查关机按键 (硬件关机的重要逻辑!)
     extern void Check_Power_Off(void);
-    Check_Power_Off(); // Important for hardware shutdown!
+    Check_Power_Off(); 
 
-    // 1Hz Loop for Housekeeping (Battery, IMU)
+    // 1Hz 频率的管家任务 (电池检测、IMU采集)
     if (HAL_GetTick() - last_qmi_print >= 1000) {
         last_qmi_print = HAL_GetTick();
 
-        // Read IMU
+        // 读取 IMU 姿态数据
         QMI8658_Read_XYZ(acc, gyro);
 
-        // Read Battery
+        // 更新电池电压
         Update_Battery_Voltage();
 
-        // Check Low Battery (New)
+        // 检查低电量状态
         Low_Battery_Check();
     }
     
-    // Task Countdown Checking
+    // 任务倒计时检查逻辑
     extern volatile uint8_t g_task_state;
-    if (g_task_state == 1) { // TASK_STATE_PENDING
+    if (g_task_state == 1) { // 1 = 任务等待中 (TASK_STATE_PENDING)
         extern uint32_t g_task_start_tick;
         extern uint32_t g_task_delay_ms;
         if (HAL_GetTick() - g_task_start_tick >= g_task_delay_ms) {
-            g_task_state = 2; // TASK_STATE_RUNNING
+            g_task_state = 2; // 2 = 任务运行中 (TASK_STATE_RUNNING)
             
-            // Sync Task State to Backup Register
+            // 将任务状态同步到备份寄存器，用于死机复位后恢复
             BackupReg_Write(BKP_REG_TASK_STATE, 2);
             BackupReg_Write(BKP_REG_TASK_ID, g_task_id);
             
             char filename[32];
-            snprintf(filename, sizeof(filename), "T_%lu.BIN", g_task_id); // Change extension to .BIN
+            snprintf(filename, sizeof(filename), "T_%lu.BIN", g_task_id); // 文件后缀为 .BIN
             
             extern volatile uint8_t g_use_binary_protocol;
             g_use_binary_protocol = 1;
             
-            // Re-use stream handler to start collection cleanly
+            // 复用 stream handler 来干净地启动数据采集
             extern cmd_response_t cmd_stream_handler(char*);
             cmd_stream_handler(filename);
-            
-            // We can also send an async notification if we want, but it's optional.
         }
     }
     
@@ -777,7 +857,7 @@ int main(void)
   }
   /* USER CODE END 3 */
   
-  return 0; // Should never reach here 
+  return 0; // 正常情况下永远不会执行到这里 
 	
 }
 
@@ -1184,7 +1264,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(ADS1299_DRDY_GPIO_Port, &GPIO_InitStruct);
 
-  /* PB10/PB11: AD5933 I2C pins, now reconfigured as simple output pulled down */
+  /* PB10/PB11: 废弃的硬件引脚，配置为下拉输出防干扰 */
   GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP; 
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
@@ -1297,14 +1377,11 @@ void Check_Power_Off(void) {
                 if (HAL_GetTick() - press_start >= 2000) {
                     // Confirm press for 2 seconds -> Power OFF
                     
-                    // Play 2.wav before power off
-                    Wav_Play("AUDIO/2.wav");
-                    while(is_playing) {
-                        Wav_Process();
-                    }
-//                    
+                    // Play 14.wav (DEVICE_SHUTDOWN) before power off
+                    Play_System_Audio(14);
+                    
                     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
-//                    
+                    
                     // Clear Magic Number before manual power off
                     BackupReg_Write(BKP_REG_MAGIC, 0);
                     
@@ -1350,52 +1427,21 @@ void Update_Battery_Voltage(void) {
 }
 
 void Low_Battery_Check(void) {
-    // Check every second (called in main loop along with Update_Battery_Voltage)
-    // Threshold: 3.5V
-    if (batt_raw_vol < 3.5f && batt_raw_vol > 1.0f) { // > 1.0f to avoid triggering on 0V (e.g. startup)
+    static uint32_t last_bat_warn = 0;
+    // 假设20%电量阈值约为3.5V
+    if (batt_raw_vol > 0 && batt_raw_vol < 3.5f) {
         low_batt_cnt++;
-        if (low_batt_cnt >= 5) { // 5 seconds continuous low
-            USB_Print("[PWR] Low Battery (%.2fV). Shutting down...\r\n", batt_raw_vol);
-            
-            // Play Shutdown Sound
-            Wav_Play("AUDIO/2.wav");
-            while(is_playing) {
-                Wav_Process();
+        if (low_batt_cnt > 5) { // 连续5次低电
+            // 每隔5分钟(300000ms)报一次警
+            if (HAL_GetTick() - last_bat_warn > 300000 || last_bat_warn == 0) {
+                Play_System_Audio(15); // BATTERY_LOW
+                last_bat_warn = HAL_GetTick();
             }
             
-            // Perform Shutdown Sequence
-            ADS1299_Stop();
-            f_close(&SDFile);
+            // Turn on Red LED (Highest Priority)
+            RGB_LED_SetSingle(LED_COLOR_RED, LED_MODE_FLASH_FAST);
             
-            // Blink LED rapidly
-            for(int i=0; i<10; i++) {
-                HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
-                HAL_Delay(100);
-            }
-            HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
-            
-            // Clear Magic Number for low battery shutdown
-            BackupReg_Write(BKP_REG_MAGIC, 0);
-            
-            // Cut Power
-            HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET);
-            
-            // If USB is connected, it might provide power and prevent shutdown.
-            // Avoid getting trapped in while(1) in that case.
-            extern volatile uint8_t g_usb_host_connected;
-            if (g_usb_host_connected == 1) {
-                // If connected to USB, do not enter while(1). 
-                // Just reset low_batt_cnt so it can try again later or let the user know.
-                // Or soft reset. Soft reset is safer to clear states.
-                NVIC_SystemReset();
-            } else {
-                // If not connected to USB host, we still might be connected to a dumb charger.
-                // Instead of while(1) which causes freezing and heating, we perform a soft reset
-                // after a short delay if power hasn't been cut yet.
-                // This ensures the device either dies gracefully or reboots cleanly if externally powered.
-                HAL_Delay(2000); 
-                NVIC_SystemReset();
-            }
+            low_batt_cnt = 5; // 防止溢出
         }
     } else {
         low_batt_cnt = 0;

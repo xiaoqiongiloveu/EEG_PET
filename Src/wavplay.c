@@ -6,6 +6,8 @@
 
 extern SAI_HandleTypeDef hsai_BlockA1;
 extern void USB_Print(const char* format, ...);
+extern volatile uint8_t g_task_state;       // From commands_impl.c
+extern volatile uint8_t g_write_sd_enabled; // From commands_impl.c
 
 __wavctrl wavctrl;
 FIL wav_file;
@@ -316,5 +318,32 @@ void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
 void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai) {
     if (hsai == &hsai_BlockA1) {
         Wav_TransferComplete_Callback();
+    }
+}
+
+/**
+ * @brief Play system audio by ID
+ * @param audio_id: 1-16 corresponding to audio filenames
+ */
+void Play_System_Audio(uint8_t audio_id) {
+    // Constraint 2: Disable ALL audio playback DURING offline collection
+    // to avoid SD card write conflicts and EEG interference.
+    // However, if the device is shutting down (14), or collection has just ended (13),
+    // or an error occurs (16), we SHOULD play the sound even if the state was RUNNING.
+    if (g_task_state == 2 && g_write_sd_enabled == 1) {
+        if (audio_id != 13 && audio_id != 14 && audio_id != 16) {
+            // We are actively collecting offline. Abort audio playback.
+            return;
+        }
+    }
+    
+    char filepath[32];
+    snprintf(filepath, sizeof(filepath), "AUDIO/%d.wav", audio_id);
+    
+    Wav_Play(filepath);
+    
+    // Blocking wait for system sounds to prevent overlapping
+    while(is_playing) {
+        Wav_Process();
     }
 }

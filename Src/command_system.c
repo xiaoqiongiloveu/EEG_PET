@@ -251,6 +251,21 @@ void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* paylo
                  BP_SendResponse(cmd_id, BP_RESP_OK, "Clearing SD Data...");
                  break;
                  
+            case BP_CMD_PAUSE:
+                 g_pending_binary_cmd = BP_CMD_PAUSE;
+                 BP_SendResponse(cmd_id, BP_RESP_OK, "Pause Pending");
+                 break;
+                 
+            case BP_CMD_RESUME:
+                 g_pending_binary_cmd = BP_CMD_RESUME;
+                 BP_SendResponse(cmd_id, BP_RESP_OK, "Resume Pending");
+                 break;
+                 
+            case BP_CMD_STOP_IMP:
+                 g_pending_binary_cmd = BP_CMD_STOP_IMP;
+                 BP_SendResponse(cmd_id, BP_RESP_OK, "Stop Imp Pending");
+                 break;
+                 
             case BP_CMD_GET_FILE:
                  if (len > 1) {
                      // Payload: CMD_ID(1) + Filename(N)

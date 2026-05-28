@@ -24,10 +24,12 @@ typedef enum {
     APP_RLD_TEST_RUNNING,
     APP_AUTO_STREAM_RUNNING,
     APP_POWER_TEST_RUNNING,
-    APP_ADC_TEST_RUNNING
+    APP_ADC_TEST_RUNNING,
+    APP_STREAM_PAUSED
 } AppState;
 
 extern volatile AppState app_state;
+extern volatile uint8_t g_write_sd_enabled;
 
 // Command Handlers
 void register_all_commands(void);
@@ -38,6 +40,11 @@ cmd_response_t cmd_conf_handler(char* args);
 cmd_response_t cmd_auto_stream_handler(char* args);
 
 cmd_response_t cmd_test_imp_all_handler(char* args);
+cmd_response_t cmd_pause_handler(char* args);
+cmd_response_t cmd_resume_handler(char* args);
+cmd_response_t cmd_stop_imp_handler(char* args);
+
+extern float g_latest_impedances[8];
 
 // Other helper functions
 void app_run_loop(void);
