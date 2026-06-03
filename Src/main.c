@@ -282,6 +282,12 @@ void User_Device_Init(void)
     // 4. 初始化 SD卡 与 FatFs
     USB_Print("[BOOT] Initializing SD Card...\r\n");
     SD_Init_Process(); 
+    
+    // 4.1 检查并获取文件系统状态 (用于给 g_sd_usage_percent 赋初值)
+    if (sd_mounted) {
+        extern void check_filesystem_impl(void);
+        check_filesystem_impl();
+    }
 
     // 5. 初始化 WM8978 音频编解码器
     USB_Print("[BOOT] Initializing WM8978...\r\n");
@@ -320,6 +326,9 @@ void User_App_Init(void)
   * @note   系统启动的总控流程，包含底层硬件配置、看门狗初始化、热启动任务恢复逻辑，
   *         以及死循环中的设备状态轮询、USB指令解析、音频状态机刷新等。
   */
+// 声明全局变量，用于缓存SD卡使用百分比
+uint8_t g_sd_usage_percent = 0;
+
 int main(void)
 {
 
@@ -492,10 +501,11 @@ int main(void)
              cmd_stream_handler(NULL);
         }
         else if (cmd == BP_CMD_GET_STATE) {
-             // 构造状态包: DeviceType(1) QMI(1) SD(1) BAT(2) DeviceState(1) TaskID(4) Ver(N) + '\0' + SN(N)
+             // 构造状态包: DeviceType(1) SDUsage%(1) SD(1) BAT(2) DeviceState(1) TaskID(4) Ver(N) + '\0' + SN(N)
              uint8_t status_payload[64];
              status_payload[0] = 1; // 设备类型: 1 = 小神探 (XiaoShenTan), 0 = 健脑师 (JianNaoShi)
-             status_payload[1] = 1; // QMI 状态正常
+             extern uint8_t g_sd_usage_percent;
+             status_payload[1] = g_sd_usage_percent; // SD卡已用空间百分比 (0-100) 从全局变量读取
              status_payload[2] = 1; // SD卡 状态正常
              uint16_t bat_mv = 415; // 4.15V (模拟值，应当替换为真实的ADC读取值)
              status_payload[3] = bat_mv & 0xFF;

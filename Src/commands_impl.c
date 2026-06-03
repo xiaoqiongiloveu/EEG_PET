@@ -508,7 +508,7 @@ static int usb_wait_tx_idle(uint32_t timeout_ms) {
  * @brief 检查并打印 SD 卡文件系统的容量与使用情况
  * @note 内部调用 FatFs API 获取总容量与剩余空间并打印到串口
  */
-static void check_filesystem_impl(void) {
+void check_filesystem_impl(void) {
   DWORD free_clust, free_size, total_size;
   FATFS *fs_ptr;
 
@@ -542,6 +542,11 @@ static void check_filesystem_impl(void) {
   if (total_size > 0) {
     float usage_percent = 100.0f - (free_size * 100.0f / total_size);
     USB_Print("  Usage: %.1f%%\r\n", usage_percent);
+    
+    // 更新全局变量缓存
+    extern uint8_t g_sd_usage_percent;
+    uint8_t int_usage = (uint8_t)usage_percent;
+    g_sd_usage_percent = (int_usage == 0) ? 1 : int_usage; // 避免显示0%，最低显示1%
   }
 }
 
@@ -982,13 +987,13 @@ cmd_response_t cmd_stream_handler(char* args) {
     } 
 
     // 3. 配置右腿驱动偏置网络 (RLD BIAS)
-    // 强烈建议只使用 CH6, CH7, CH8 参与偏置网络以保证模拟环路稳定
+    // 根据需求改回全通道引入 BIAS
     // 切勿动态切换偏置通道，以防止模拟阶跃响应和振荡
     if (g_cfg_bias_en) {
         // 开启 BIAS 放大器 (0xEC = 1110 1100)
         ADS1299_Write_Reg(0x03, 0xEC); 
-        ADS1299_Write_Reg(0x0D, 0xE0); // 仅启用 CH6, CH7, CH8 的 BIAS_SENSP (1110 0000)
-        current_bias_sensp_mask = 0xE0; // 初始化运行时掩码记录
+        ADS1299_Write_Reg(0x0D, 0xFF); // 启用全通道(CH1-CH8) 的 BIAS_SENSP
+        current_bias_sensp_mask = 0xFF; // 初始化运行时掩码记录
     } else {
         // 关闭 BIAS 放大器 (0xE8 = 1110 1000)
         ADS1299_Write_Reg(0x03, 0xE8);
@@ -1134,11 +1139,11 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
     } 
 
     // 3. 配置右腿驱动偏置网络 (RLD BIAS) - 初始设置
-    // 强烈建议只使用 CH6, CH7, CH8 参与偏置网络以保证模拟环路稳定
+    // 根据需求改回全通道引入 BIAS
     if (g_cfg_bias_en) {
         ADS1299_Write_Reg(0x03, 0xEC); 
-        ADS1299_Write_Reg(0x0D, 0xE0); // 仅启用 CH6, CH7, CH8 的 BIAS_SENSP (1110 0000)
-        current_bias_sensp_mask = 0xE0; // 初始化运行时掩码记录
+        ADS1299_Write_Reg(0x0D, 0xFF); // 启用全通道(CH1-CH8) 的 BIAS_SENSP
+        current_bias_sensp_mask = 0xFF; // 初始化运行时掩码记录
     } else {
         ADS1299_Write_Reg(0x03, 0xE8);
         ADS1299_Write_Reg(0x0D, 0x00);
@@ -1646,8 +1651,15 @@ void app_run_loop(void) {
                 motion_state_t final_state = Motion_State_Update(motion_score);
                 g_latest_motion_state = (uint8_t)final_state;
                 
-                // Trigger ARTIFACT_HIGH Audio
-                if (final_state == MOTION_SEVERE || final_state == MOTION_ARTIFACT) {
+                // Trigger ARTIFACT_HIGH Audio (连续2秒最高等级 MOTION_SEVERE)
+                static uint8_t severe_consecutive_count = 0;
+                if (final_state == MOTION_SEVERE) {
+                    severe_consecutive_count++;
+                } else {
+                    severe_consecutive_count = 0;
+                }
+
+                if (severe_consecutive_count >= 2) {
                     static uint32_t last_motion_warn = 0;
                     if (HAL_GetTick() - last_motion_warn > 10000) { // 10秒防抖
                         Play_System_Audio(11); // ARTIFACT_HIGH
