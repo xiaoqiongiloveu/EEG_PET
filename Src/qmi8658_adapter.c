@@ -4,18 +4,18 @@
 #include "delay.h"
 #include "math.h"
 
-/* Global Variables */
+/* 全局变量 */
 uint8_t g_imu_init = 0;
 qmi8658_state g_imu;
 
-/* Helper for Printing */
+/* 打印调试辅助 */
 // #define printf(...) 
 
 /**
- * @brief   Write a byte to QMI8658 register
- * @param   reg: Register address
- * @param   data: Data to write
- * @retval  0: Success, 1: Failure
+ * @brief   向 QMI8658 寄存器写入一个字节
+ * @param   reg: 寄存器地址
+ * @param   data: 要写入的数据
+ * @retval  0: 成功, 1: 失败
  */
 static uint8_t QMI8658_Write_Byte(uint8_t reg, uint8_t data)
 {
@@ -44,9 +44,9 @@ static uint8_t QMI8658_Write_Byte(uint8_t reg, uint8_t data)
 }
 
 /**
- * @brief   Read a byte from QMI8658 register
- * @param   reg: Register address
- * @retval  Read value
+ * @brief   从 QMI8658 寄存器读取一个字节
+ * @param   reg: 寄存器地址
+ * @retval  读取到的值
  */
 static uint8_t QMI8658_Read_Byte(uint8_t reg)
 {
@@ -57,7 +57,7 @@ static uint8_t QMI8658_Read_Byte(uint8_t reg)
     if (Soft_I2C_WaitAck() != 0)
     {
         Soft_I2C_Stop();
-        return 0; // Return 0 on error
+        return 0; // 发生错误时返回 0
     }
     Soft_I2C_SendByte(reg);
     if (Soft_I2C_WaitAck() != 0)
@@ -73,8 +73,8 @@ static uint8_t QMI8658_Read_Byte(uint8_t reg)
         Soft_I2C_Stop();
         return 0;
     }
-    // Reference: iic_read_byte(0) -> NACK
-    // Target: Soft_I2C_ReadByte(1) -> NACK (1=NACK in Target)
+    // 参考: iic_read_byte(0) -> NACK
+    // 目标: Soft_I2C_ReadByte(1) -> NACK (目标函数中 1=NACK)
     temp = Soft_I2C_ReadByte(1); 
     Soft_I2C_Stop();
     
@@ -82,11 +82,11 @@ static uint8_t QMI8658_Read_Byte(uint8_t reg)
 }
 
 /**
- * @brief   Read N bytes from QMI8658
- * @param   reg: Register address
- * @param   buf: Buffer to store data
- * @param   len: Length to read
- * @retval  0: Success, 1: Failure
+ * @brief   从 QMI8658 连续读取 N 个字节
+ * @param   reg: 寄存器起始地址
+ * @param   buf: 存储数据的缓冲区
+ * @param   len: 读取长度
+ * @retval  0: 成功, 1: 失败
  */
 static int QMI8658_Read_NBytes(uint8_t reg, uint8_t *buf, uint8_t len)
 {
@@ -115,13 +115,13 @@ static int QMI8658_Read_NBytes(uint8_t reg, uint8_t *buf, uint8_t len)
     }
     for (i = 0; i < len; i++)
     {
-        // Reference: iic_read_byte((i == (len - 1)) ? 0 : 1); 
-        // Ref: 0=NACK, 1=ACK.
-        // Target: Soft_I2C_ReadByte(ack);
-        // Target: 1=NACK, 0=ACK.
-        // So we need to INVERT the logic.
-        // If last byte (i == len-1), we want NACK. Ref sends 0. Target should send 1.
-        // If not last byte, we want ACK. Ref sends 1. Target should send 0.
+        // 参考: iic_read_byte((i == (len - 1)) ? 0 : 1); 
+        // 参考代码中: 0=NACK, 1=ACK.
+        // 目标: Soft_I2C_ReadByte(ack);
+        // 目标代码中: 1=NACK, 0=ACK.
+        // 所以我们需要反转逻辑。
+        // 如果是最后一个字节 (i == len-1), 我们需要 NACK。参考代码发送 0，目标代码应发送 1。
+        // 如果不是最后一个字节, 我们需要 ACK。参考代码发送 1，目标代码应发送 0。
         
         if (i == (len - 1)) {
             buf[i] = Soft_I2C_ReadByte(1); // NACK
@@ -135,8 +135,8 @@ static int QMI8658_Read_NBytes(uint8_t reg, uint8_t *buf, uint8_t len)
 }
 
 /**
- * @brief   Check Device ID
- * @retval  0: Success, 1: Failure
+ * @brief   检查设备 ID
+ * @retval  0: 成功, 1: 失败
  */
 static uint8_t QMI8658_Check_WhoAmI(void)
 {
@@ -166,15 +166,15 @@ static uint8_t QMI8658_Check_WhoAmI(void)
 }
 
 /**
- * @brief   Sensor Calibration
- * @retval  0: Success, 1: Failure
+ * @brief   传感器校准
+ * @retval  0: 成功, 1: 失败
  */
 static uint8_t QMI8658_Calibration(void)
 {
     uint8_t sta = 0;
-    QMI8658_Write_Byte(Register_Ctrl7, 0x00);   /* Disable Gyro/Acc */
-    QMI8658_Write_Byte(Register_Ctrl9, 0xA2);   /* On Demand Calibration */
-    delay_ms(2000); // Wait for calibration
+    QMI8658_Write_Byte(Register_Ctrl7, 0x00);   /* 禁用陀螺仪/加速度计 */
+    QMI8658_Write_Byte(Register_Ctrl9, 0xA2);   /* 按需校准 (On Demand Calibration) */
+    delay_ms(2000); // 等待校准完成
     sta = QMI8658_Read_Byte(Register_COD_Status);
     if(sta == 0x00)
     {
@@ -183,7 +183,7 @@ static uint8_t QMI8658_Calibration(void)
 }
 
 /**
- * @brief   Reset Sensor
+ * @brief   复位传感器
  */
 void QMI8658_Reset(void)
 {
@@ -192,7 +192,7 @@ void QMI8658_Reset(void)
 }
 
 /**
- * @brief   Send Command to Ctrl9
+ * @brief   向 Ctrl9 发送命令
  */
 static int QMI8658_Send_Ctl9Cmd(enum Ctrl9Command cmd)
 {
@@ -245,7 +245,7 @@ static int QMI8658_Send_Ctl9Cmd(enum Ctrl9Command cmd)
 }
 
 /**
- * @brief   Config Accelerometer
+ * @brief   配置加速度计
  */
 static void QMI8658_Config_Acc(enum qmi8658_accrange range, enum qmi8658_accodr odr, enum qmi8658_LpfConfig lpfEnable, enum qmi8658_StConfig stEnable)
 {
@@ -284,7 +284,7 @@ static void QMI8658_Config_Acc(enum qmi8658_accrange range, enum qmi8658_accodr 
 }
 
 /**
- * @brief   Config Gyroscope
+ * @brief   配置陀螺仪
  */
 static void QMI8658_Config_Gyro(enum qmi8658_gyrrange range, enum qmi8658_gyrodr odr, enum qmi8658_LpfConfig lpfEnable, enum qmi8658_StConfig stEnable)
 {
@@ -328,7 +328,7 @@ static void QMI8658_Config_Gyro(enum qmi8658_gyrrange range, enum qmi8658_gyrodr
 }
 
 /**
- * @brief   Enable AHB Clock
+ * @brief   使能 AHB 时钟
  */
 static void QMI8658_Enable_Ahb_Clock(int enable)
 {
@@ -347,7 +347,7 @@ static void QMI8658_Enable_Ahb_Clock(int enable)
 }
 
 /**
- * @brief   Enable Sensors
+ * @brief   使能传感器
  */
 static void QMI8658_EnableSensors(unsigned char enableFlags)
 {
@@ -364,7 +364,7 @@ static void QMI8658_EnableSensors(unsigned char enableFlags)
 }
 
 /**
- * @brief   Config Registers (Public)
+ * @brief   配置寄存器 (公共接口)
  */
 void QMI8658_Config_Reg(unsigned char low_power)
 {
@@ -397,7 +397,7 @@ void QMI8658_Config_Reg(unsigned char low_power)
 }
 
 /**
- * @brief   Get Temperature (Public)
+ * @brief   获取温度 (公共接口)
  */
 float QMI8658_Get_Temperature(void)
 {
@@ -412,7 +412,7 @@ float QMI8658_Get_Temperature(void)
 }
 
 /**
- * @brief   Read Sensor Data (Internal Helper)
+ * @brief   读取传感器数据 (内部辅助函数)
  */
 static void QMI8658_Read_Sensor_Data(float *acc, float *gyro)
 {
@@ -449,7 +449,7 @@ static void QMI8658_Read_Sensor_Data(float *acc, float *gyro)
 
     if (g_imu_init != 1)
     {
-        // Zero out output during calibration to prevent garbage values
+        // 在校准期间将输出置零，防止出现垃圾值
         for (axis = 0; axis < 3; axis++) {
             acc[axis] = 0.0f;
             gyro[axis] = 0.0f;
@@ -492,7 +492,7 @@ static void QMI8658_Read_Sensor_Data(float *acc, float *gyro)
             acc[axis] = acc_raw[axis] + offset_acc[axis];
             gyro[axis] = gyro_raw[axis] + offset_gyro[axis];
             
-            // Limit check
+            // 极限值检查
             if (acc[axis] > 200.0f) acc[axis] = 200.0f;
             if (acc[axis] < -200.0f) acc[axis] = -200.0f;
             if (gyro[axis] > 20000.0f) gyro[axis] = 20000.0f;
@@ -502,7 +502,7 @@ static void QMI8658_Read_Sensor_Data(float *acc, float *gyro)
 }
 
 /**
- * @brief   Read XYZ (Public)
+ * @brief   读取 XYZ 数据 (公共接口)
  */
 void QMI8658_Read_XYZ(float *acc, float *gyro)
 {
@@ -552,8 +552,8 @@ void QMI8658_Read_XYZ(float *acc, float *gyro)
 }
 
 /**
- * @brief   Initialize QMI8658 (Public)
- * @retval  0: Success, 1: Failure
+ * @brief   初始化 QMI8658 (公共接口)
+ * @retval  0: 成功, 1: 失败
  */
 uint8_t QMI8658_Init(void)
 {
@@ -571,19 +571,19 @@ uint8_t QMI8658_Init(void)
     }
     USB_Print("QMI8658 Calibration Success!\r\n");
 
-    QMI8658_Write_Byte(Register_Ctrl1, 0x60);   /* I2C Address Auto-Inc */
-    QMI8658_Write_Byte(Register_Ctrl7, 0x00);   /* Disable Sensors */
+    QMI8658_Write_Byte(Register_Ctrl1, 0x60);   /* I2C 地址自动递增 */
+    QMI8658_Write_Byte(Register_Ctrl7, 0x00);   /* 禁用传感器 */
     
-    QMI8658_Config_Reg(0);                      /* Configure Sensors */
-    QMI8658_EnableSensors(g_imu.cfg.ensensors); /* Enable Sensors */
+    QMI8658_Config_Reg(0);                      /* 配置传感器 */
+    QMI8658_EnableSensors(g_imu.cfg.ensensors); /* 使能传感器 */
 
-    /* Perform fast calibration immediately after init */
-    /* This prevents waiting 100 seconds in 1Hz low-speed sampling modes */
+    /* 在初始化后立即执行快速校准 */
+    /* 这可以防止在 1Hz 低速采样模式下等待 100 秒 */
     float acc[3], gyro[3];
     for(int i = 0; i <= MAX_CALI_COUNT + 10; i++)
     {
         QMI8658_Read_XYZ(acc, gyro);
-        delay_ms(2); // Wait for next sample (500Hz ODR = 2ms)
+        delay_ms(2); // 等待下一次采样 (500Hz ODR = 2ms)
     }
 
     return 0;

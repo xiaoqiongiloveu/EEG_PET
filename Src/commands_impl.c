@@ -1700,8 +1700,8 @@ void app_run_loop(void) {
                      aux_payload[15] = 0;
                      
                      static uint16_t aux_seq = 0;
-                     uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_AUX, aux_seq++, aux_payload, 16);
-                     CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                    uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_AUX, aux_seq++, HAL_GetTick(), aux_payload, 16);
+                    CDC_Transmit_FS(g_bp_tx_buf, tx_len);
                      
                 } else {
                     char aux_line[128];
@@ -1725,8 +1725,8 @@ void app_run_loop(void) {
         }
 
         uint8_t packet[27];
-        // ADS1299 数据包: 3 字节状态字 + 8 * 3 字节数据 = 27 字节
-        while (circular_buffer_get_data_count(&ADS1299_circula_buffer) >= 27) {
+        // ADS1299 数据包: 3 字节状态字 + 8 * 3 字节数据 = 27 字节 + 4 字节时间戳 = 31 字节
+        while (circular_buffer_get_data_count(&ADS1299_circula_buffer) >= 31) {
             // 帧同步检查: 探查第一个字节以验证其是否为 ADS1299 状态字头 (0xC0)
             uint8_t header_byte;
             circular_buffer_pop(&ADS1299_circula_buffer, &header_byte);
@@ -1739,6 +1739,11 @@ void app_run_loop(void) {
             // 找到有效的帧头。将其放入 packet[0] 并读取剩余的 26 字节。
             packet[0] = header_byte;
             circular_buffer_read(&ADS1299_circula_buffer, &packet[1], 26);
+            
+            // 提取硬件时间戳
+            uint8_t ts_buf[4];
+            circular_buffer_read(&ADS1299_circula_buffer, ts_buf, 4);
+            uint32_t packet_ts = ((uint32_t)ts_buf[0] << 24) | ((uint32_t)ts_buf[1] << 16) | ((uint32_t)ts_buf[2] << 8) | ts_buf[3];
             
             static char line[256];
             int len = 0;
@@ -1963,25 +1968,35 @@ void app_run_loop(void) {
                              // 单位: 1 kOhm
                              // impedances[i] 单位为 Ohm，除以 1000 得到 kOhm
                              float imp_kohm = impedances[i] / 1000.0f;
+                             
+                             // 新增逻辑：如果计算出的阻抗小于 100kOhm，则再除以 10
+                             if (imp_kohm < 100.0f) {
+                                 imp_kohm = imp_kohm / 10.0f;
+                             }
+                             
                              if (imp_kohm > 65535.0f) imp_kohm = 65535.0f;
                              uint16_t imp_val = (uint16_t)imp_kohm;
                              memcpy(&imp_payload[i*2], &imp_val, 2);
                         }
                         static uint16_t imp_seq = 0;
-                        uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_IMP, imp_seq++, imp_payload, 16);
+                        uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_IMP, imp_seq++, HAL_GetTick(), imp_payload, 16);
                         CDC_Transmit_FS(g_bp_tx_buf, tx_len);
                     } else {
                         char imp_buf[256];
+                        int ascii_imp[8];
+                        
+                        for (int i=0; i<8; i++) {
+                            float imp_kohm = impedances[i] / 1000.0f;
+                            if (imp_kohm < 100.0f) {
+                                imp_kohm = imp_kohm / 10.0f;
+                            }
+                            ascii_imp[i] = (int)(imp_kohm > 9999.0f ? 9999 : imp_kohm);
+                        }
+                        
                         snprintf(imp_buf, sizeof(imp_buf), 
                             "IMP:F5:%d,F3:%d,FZ:%d,F4:%d,F6:%d,AF8:%d,FPZ:%d,AF7:%d\r\n",
-                            (int)(impedances[0] > 9999000 ? 9999 : impedances[0]/1000),
-                            (int)(impedances[1] > 9999000 ? 9999 : impedances[1]/1000),
-                            (int)(impedances[2] > 9999000 ? 9999 : impedances[2]/1000),
-                            (int)(impedances[3] > 9999000 ? 9999 : impedances[3]/1000),
-                            (int)(impedances[4] > 9999000 ? 9999 : impedances[4]/1000),
-                            (int)(impedances[5] > 9999000 ? 9999 : impedances[5]/1000),
-                            (int)(impedances[6] > 9999000 ? 9999 : impedances[6]/1000),
-                            (int)(impedances[7] > 9999000 ? 9999 : impedances[7]/1000)
+                            ascii_imp[0], ascii_imp[1], ascii_imp[2], ascii_imp[3], 
+                            ascii_imp[4], ascii_imp[5], ascii_imp[6], ascii_imp[7]
                         );
                         USB_SendString(imp_buf);
                     }
@@ -2187,7 +2202,7 @@ void app_run_loop(void) {
                         aux_payload[15] = 0;
 
                         static uint16_t aux_seq_auto = 0;
-                        uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_AUX, aux_seq_auto++, aux_payload, 16);
+                        uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_AUX, aux_seq_auto++, HAL_GetTick(), aux_payload, 16);
                         CDC_Transmit_FS(g_bp_tx_buf, tx_len);
                     } else {
                         extern float batt_raw_vol;
@@ -2252,7 +2267,7 @@ void app_run_loop(void) {
                     }
                     
                     static uint16_t bin_seq = 0;
-                    uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, g_bp_payload, 47);
+                    uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, packet_ts, g_bp_payload, 47);
                     
                     // 直接发送 (无减速)
                     uint8_t usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
@@ -2397,7 +2412,7 @@ void app_run_loop(void) {
                     }
                     
                     static uint16_t bin_seq = 0;
-                    uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, g_bp_payload, 47);
+                    uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, packet_ts, g_bp_payload, 47);
                     
                     // 直接发送 (无减速)
                     uint8_t usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);

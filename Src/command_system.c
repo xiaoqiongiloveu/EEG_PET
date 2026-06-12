@@ -82,7 +82,7 @@ void BP_SendResponse(uint8_t cmd_id, uint8_t status, const char* msg) {
     memcpy(&payload[2], msg, msg_len);
     
     uint8_t tx_buf[128];
-    uint16_t len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, payload, 2 + msg_len);
+    uint16_t len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, HAL_GetTick(), payload, 2 + msg_len);
     CDC_Transmit_FS(tx_buf, len);
     
     // ----- 记录二进制命令响应日志 -----

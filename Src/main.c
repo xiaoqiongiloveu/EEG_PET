@@ -570,8 +570,8 @@ int main(void)
              offset += strlen(sn); // 最后一个字符串不需要加 null 终止符
              
              uint8_t tx_buf[128];
-             uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_STATUS, 0, status_payload, offset); // 注意：此处是异步发送，Seq固定为0
-             CDC_Transmit_FS(tx_buf, tx_len);
+            uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_STATUS, 0, HAL_GetTick(), status_payload, offset); // 注意：此处是异步发送，Seq固定为0
+            CDC_Transmit_FS(tx_buf, tx_len);
              
              // 基于PB3电平跳变的音频输出切换逻辑
              uint8_t current_pb3 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3);
@@ -689,9 +689,9 @@ int main(void)
                  payload[1] = BP_RESP_OK;
                  if (offset > 508) offset = 508; // 安全上限
                  memcpy(&payload[2], file_list, offset);
-                 
-                 uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, payload, 2 + offset);
-                 CDC_Transmit_FS(tx_buf, tx_len);
+                
+                uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, HAL_GetTick(), payload, 2 + offset);
+                CDC_Transmit_FS(tx_buf, tx_len);
              } else {
                  BP_SendResponse(BP_CMD_LIST_FILES, BP_RESP_ERR, "Open Dir Failed");
              }
@@ -794,10 +794,10 @@ int main(void)
                      
                      // 发送数据包
                      // 暂时使用 BP_TYPE_OTA (0x20) 作为通用文件数据传输类型
-                     uint8_t tx_buf[300];
-                      uint16_t tx_len = BP_Pack(tx_buf, 0x20, seq++, read_buf, br); // 0x20 = OTA/文件类型
-                      
-                      uint8_t res = CDC_Transmit_FS(tx_buf, tx_len);
+                    uint8_t tx_buf[300];
+                     uint16_t tx_len = BP_Pack(tx_buf, 0x20, seq++, HAL_GetTick(), read_buf, br); // 0x20 = OTA/文件类型
+                     
+                     uint8_t res = CDC_Transmit_FS(tx_buf, tx_len);
                       if (res == USBD_BUSY) {
                           HAL_Delay(2); // 稍作等待
                           res = CDC_Transmit_FS(tx_buf, tx_len);
@@ -1389,6 +1389,13 @@ void Check_Power_Off(void) {
                     
                     // Play 14.wav (DEVICE_SHUTDOWN) before power off
                     Play_System_Audio(14);
+                    
+                    // 等待音频播放完毕，期间持续搬运数据，防止提前断电导致没有声音
+                    extern uint8_t is_playing;
+                    extern void Wav_Process(void);
+                    while(is_playing) {
+                        Wav_Process();
+                    }
                     
                     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
                     

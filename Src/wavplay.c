@@ -342,8 +342,6 @@ void Play_System_Audio(uint8_t audio_id) {
     
     Wav_Play(filepath);
     
-    // Blocking wait for system sounds to prevent overlapping
-    while(is_playing) {
-        Wav_Process();
-    }
+    // 移除了死循环阻塞，改为异步播放
+    // 播放缓冲区的填充将在主循环中通过 Wav_Process() 完成
 }

@@ -95,7 +95,7 @@ typedef struct {
 // --- API ---
 void BP_Init(BP_Parser_t* parser, void (*cb)(uint8_t, uint16_t, uint32_t, uint8_t*, uint16_t));
 void BP_ProcessByte(BP_Parser_t* parser, uint8_t byte);
-uint16_t BP_Pack(uint8_t* dest, uint8_t type, uint16_t seq, uint8_t* payload, uint16_t len);
+uint16_t BP_Pack(uint8_t* dest, uint8_t type, uint16_t seq, uint32_t ts, uint8_t* payload, uint16_t len);
 uint16_t BP_CRC16(uint8_t* data, uint16_t len);
 
 extern volatile uint8_t g_use_binary_protocol;

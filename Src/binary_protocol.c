@@ -1,8 +1,9 @@
 #include "binary_protocol.h"
 
+/* 全局协议模式标志，0: ASCII 文本模式, 1: Binary 二进制模式 */
 volatile uint8_t g_use_binary_protocol = 0; // 0: ASCII, 1: Binary
 
-// CRC16-CCITT (Poly 0x1021) Table
+// CRC16-CCITT (Poly 0x1021) 查表法使用的常量表
 static const uint16_t crc16_table[256] = {
     0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
     0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
@@ -38,6 +39,12 @@ static const uint16_t crc16_table[256] = {
     0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
 };
 
+/**
+ * @brief  计算二进制数据的 CRC16-CCITT 校验和
+ * @param  data: 指向需要计算校验和的数据缓冲区的指针
+ * @param  len: 需要计算的数据长度（字节数）
+ * @retval 计算得到的 16 位 CRC 校验值
+ */
 uint16_t BP_CRC16(uint8_t* data, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
@@ -47,6 +54,11 @@ uint16_t BP_CRC16(uint8_t* data, uint16_t len)
     return crc;
 }
 
+/**
+ * @brief  初始化二进制协议解析器
+ * @param  parser: 指向解析器状态结构体的指针
+ * @param  cb: 解析出完整有效帧后触发的回调函数，包含参数 (类型, 序列号, 时间戳, 载荷指针, 载荷长度)
+ */
 void BP_Init(BP_Parser_t* parser, void (*cb)(uint8_t, uint16_t, uint32_t, uint8_t*, uint16_t))
 {
     parser->state = BP_STATE_SYNC1;
@@ -54,17 +66,23 @@ void BP_Init(BP_Parser_t* parser, void (*cb)(uint8_t, uint16_t, uint32_t, uint8_
     parser->bytes_read = 0;
 }
 
+/**
+ * @brief  处理接收到的单个字节数据 (基于状态机的解析流)
+ * @param  parser: 指向解析器状态结构体的指针
+ * @param  byte: 接收到的单字节数据
+ * @note   支持连续传入字节，内部维护解析状态，校验通过后自动调用注册的回调函数
+ */
 void BP_ProcessByte(BP_Parser_t* parser, uint8_t byte)
 {
-    // Simple state machine
+    // 简单的解析状态机
     switch (parser->state) {
         case BP_STATE_SYNC1:
-            if (byte == 0x55) parser->state = BP_STATE_SYNC2; // Wait, 0xAA55 LE is 55 AA
+            if (byte == 0x55) parser->state = BP_STATE_SYNC2; // 等待同步头, 0xAA55 小端模式下为 55 AA
             break;
             
         case BP_STATE_SYNC2:
             if (byte == 0xAA) parser->state = BP_STATE_LEN1;
-            else parser->state = BP_STATE_SYNC1; // Reset
+            else parser->state = BP_STATE_SYNC1; // 同步失败，重置状态
             break;
             
         case BP_STATE_LEN1:
@@ -74,10 +92,10 @@ void BP_ProcessByte(BP_Parser_t* parser, uint8_t byte)
             
         case BP_STATE_LEN2:
             parser->payload_len |= (uint16_t)byte << 8;
-            // Validate Length
+            // 校验长度有效性
             if (parser->payload_len > BP_MAX_PAYLOAD_SIZE || parser->payload_len < 7) {
-                // Invalid length, reset. 
-                // Min length = 1(Type) + 2(Seq) + 4(TS) = 7 bytes
+                // 长度无效，重置状态。
+                // 最小长度 = 1(Type) + 2(Seq) + 4(TS) = 7 字节
                 parser->state = BP_STATE_SYNC1;
             } else {
                 parser->state = BP_STATE_PAYLOAD;
@@ -93,27 +111,26 @@ void BP_ProcessByte(BP_Parser_t* parser, uint8_t byte)
             break;
             
         case BP_STATE_CRC1:
-            parser->buffer[parser->bytes_read] = byte; // Store CRC Low (temp reuse buffer?)
-            // Actually, buffer holds Type+Seq+TS+Payload.
-            // Let's store CRC separately? Or append to buffer?
-            // Let's append to buffer for simplicity, make sure buffer size is enough
+            parser->buffer[parser->bytes_read] = byte; // 存储 CRC 低字节 (为了计算方便，暂时存入 buffer 末尾)
+            // 实际上 buffer 此时包含的是 Type+Seq+TS+Payload。
+            // 我们将 CRC 追加到 buffer 中，以便一并处理。
             parser->buffer[parser->bytes_read++] = byte;
             parser->state = BP_STATE_CRC2;
             break;
             
         case BP_STATE_CRC2:
         {
-            parser->buffer[parser->bytes_read++] = byte; // CRC High
+            parser->buffer[parser->bytes_read++] = byte; // 存储 CRC 高字节
             
-            // Validate CRC
-            // Buffer contains: Type(1) + Seq(2) + TS(4) + Data(N) + CRC(2)
-            // CRC calculated over: Type...Data
-            uint16_t data_len = parser->payload_len; // Length of Type..Data
+            // 校验 CRC
+            // 当前 Buffer 包含: Type(1) + Seq(2) + TS(4) + Data(N) + CRC(2)
+            // CRC 计算范围: Type...Data
+            uint16_t data_len = parser->payload_len; // Type..Data 的总长度
             uint16_t crc_calc = BP_CRC16(parser->buffer, data_len);
             uint16_t crc_recv = parser->buffer[data_len] | (parser->buffer[data_len+1] << 8);
             
             if (crc_calc == crc_recv) {
-                // Frame Valid! Extract fields
+                // 帧校验有效！提取各个字段
                 uint8_t type = parser->buffer[0];
                 uint16_t seq = parser->buffer[1] | (parser->buffer[2] << 8);
                 uint32_t ts  = parser->buffer[3] | (parser->buffer[4] << 8) | (parser->buffer[5] << 16) | (parser->buffer[6] << 24);
@@ -125,7 +142,7 @@ void BP_ProcessByte(BP_Parser_t* parser, uint8_t byte)
                 }
             }
             
-            parser->state = BP_STATE_SYNC1; // Reset for next frame
+            parser->state = BP_STATE_SYNC1; // 重置状态以接收下一帧
             break;
         }
             
@@ -135,22 +152,31 @@ void BP_ProcessByte(BP_Parser_t* parser, uint8_t byte)
     }
 }
 
-uint16_t BP_Pack(uint8_t* dest, uint8_t type, uint16_t seq, uint8_t* payload, uint16_t len)
+/**
+ * @brief  将数据打包成符合协议的二进制帧
+ * @param  dest: 用于存放打包后完整帧数据的目标缓冲区
+ * @param  type: 数据包类型标志 (如 TYPE_EEG, TYPE_IMU 等)
+ * @param  seq: 数据包序列号 (用于防丢包检测)
+ * @param  ts: 硬件级时间戳 (毫秒级或微秒级)
+ * @param  payload: 指向实际需要传输的业务数据 (载荷) 的指针
+ * @param  len: 业务数据 (载荷) 的长度
+ * @retval 打包后的完整帧长度 (字节数)，包含同步头、包头、载荷和 CRC
+ */
+uint16_t BP_Pack(uint8_t* dest, uint8_t type, uint16_t seq, uint32_t ts, uint8_t* payload, uint16_t len)
 {
-    // Frame: Sync(2) + Len(2) + Type(1) + Seq(2) + TS(4) + Payload(N) + CRC(2)
-    // Len field = 1 + 2 + 4 + N = 7 + N
+    // 完整帧结构: Sync(2) + Len(2) + Type(1) + Seq(2) + TS(4) + Payload(N) + CRC(2)
+    // 长度字段 (Len field) 所指范围 = 1 + 2 + 4 + N = 7 + N
     
     uint16_t total_len = 0;
-    uint32_t ts = 0; // TODO: Get HAL_GetTick()
     uint16_t frame_len_field = 7 + len;
     
-    // Header
+    // Header (帧头: 包含 Sync 与 Len)
     dest[0] = 0x55;
     dest[1] = 0xAA;
     dest[2] = frame_len_field & 0xFF;
     dest[3] = (frame_len_field >> 8) & 0xFF;
     
-    // Body (for CRC)
+    // Body (参与 CRC 计算的主体部分: Type + Seq + TS)
     dest[4] = type;
     dest[5] = seq & 0xFF;
     dest[6] = (seq >> 8) & 0xFF;
@@ -159,16 +185,16 @@ uint16_t BP_Pack(uint8_t* dest, uint8_t type, uint16_t seq, uint8_t* payload, ui
     dest[9] = (ts >> 16) & 0xFF;
     dest[10] = (ts >> 24) & 0xFF;
     
-    // Payload
+    // Payload (载荷数据)
     if (len > 0 && payload) {
         memcpy(&dest[11], payload, len);
     }
     
-    // CRC
+    // CRC (对帧头以后的主体及载荷进行校验)
     uint16_t crc = BP_CRC16(&dest[4], frame_len_field);
     uint16_t crc_offset = 4 + frame_len_field;
     dest[crc_offset] = crc & 0xFF;
     dest[crc_offset+1] = (crc >> 8) & 0xFF;
     
-    return crc_offset + 2; // Total bytes written
+    return crc_offset + 2; // 返回总写入的字节数
 }
