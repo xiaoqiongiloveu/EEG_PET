@@ -2,51 +2,46 @@
 /**
   ******************************************************************************
   * @file   fatfs.c
-  * @brief  Code for fatfs applications
+  * @brief  使用 FatFs 中间件配置文件的代码。
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * 版权所有 (c) 2026 STMicroelectronics。
+  * 保留所有权利。
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * 本软件根据随此软件包分发的 LICENSE 文件中的条款进行许可。
+  * 如果未随附 LICENSE 文件，则本软件“按原样”提供。
   *
   ******************************************************************************
   */
-/* USER CODE END Header */
+/* 包含文件 ------------------------------------------------------------------*/
 #include "fatfs.h"
 
-uint8_t retSD;    /* Return value for SD */
-char SDPath[4];   /* SD logical drive path */
-__attribute__((aligned(4))) FATFS SDFatFS;    /* File system object for SD logical drive */
-__attribute__((aligned(4))) FIL SDFile;       /* File object for SD */
+uint8_t retSD;    /* 链接 SD 卡返回的返回值 */
+char SDPath[4];   /* SD 卡逻辑驱动器路径 */
+__attribute__((aligned(4))) FATFS SDFatFS;    /* SD 卡逻辑驱动器的文件系统工作区对象 */
+__attribute__((aligned(4))) FIL SDFile;       /* SD 卡的文件对象 */
 
-/* USER CODE BEGIN Variables */
+/* 用户代码 BEGIN Variables */
 
-/* USER CODE END Variables */
+/* 用户代码 END Variables */
 
 void MX_FATFS_Init(void)
 {
-  /*## FatFS: Link the SD driver ###########################*/
+  /*## FatFS: 在这里链接磁盘 I/O 驱动 ###########################*/
   retSD = FATFS_LinkDriver(&SD_Driver, SDPath);
 
-  /* USER CODE BEGIN Init */
-  /* additional user code for init */
-  /* USER CODE END Init */
+  /* 用户代码 BEGIN Init */
+  /* 可在下方添加额外的用户初始化代码 */
+  /* 用户代码 END Init */
 }
 
-/**
-  * @brief  Gets Time from RTC
-  * @param  None
-  * @retval Time in DWORD
-  */
+/* 获取基于毫秒的时间 */
 DWORD get_fattime(void)
 {
-  /* USER CODE BEGIN get_fattime */
+  /* 用户代码 BEGIN get_fattime */
   return 0;
-  /* USER CODE END get_fattime */
+  /* 用户代码 END get_fattime */  
 }
 
 /* USER CODE BEGIN Application */

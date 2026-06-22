@@ -1258,8 +1258,11 @@ cmd_response_t cmd_conf_handler(char* args) {
         if (n >= 4) g_cfg_input_type = (uint8_t)input_type;
         if (n >= 5) g_cfg_bias_en = (uint8_t)bias_en;
         
-        sprintf(response.message, "OK: Config Set (Mask=0x%02X, Gain=%d, SPS=%d, Input=%d, Bias=%d)", 
+        sprintf(response.message, "OK: Config Set (Mask=0x%02X, Gain=%d, SPS=%d, Input=%d, Bias=%d)",
                 g_cfg_ch_mask, g_cfg_gain, g_cfg_sps, g_cfg_input_type, g_cfg_bias_en);
+        
+        // 方案配置下发成功，播放提示音 17
+        Play_System_Audio(17);
     } else {
         response.success = 0;
         sprintf(response.message, "ERR: Usage CONF:MASK(hex),GAIN,SPS,INPUT_TYPE,BIAS_EN");
