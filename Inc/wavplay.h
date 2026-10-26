@@ -1,6 +1,8 @@
 #ifndef __WAVPLAY_H
 #define __WAVPLAY_H
 
+/* Audio hardware removed; declarations retained for reference. */
+#if 0
 #include "main.h"
 #include "fatfs.h"
 
@@ -76,4 +78,5 @@ void Wav_Stop(void);
 void Wav_Process(void);
 void Play_System_Audio(uint8_t audio_id);
 
+#endif /* Audio hardware removed */
 #endif

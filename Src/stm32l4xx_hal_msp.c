@@ -52,7 +52,7 @@
 /* External functions --------------------------------------------------------*/
 /* USER CODE BEGIN ExternalFunctions */
 extern DMA_HandleTypeDef hdma_sdmmc1;
-extern DMA_HandleTypeDef hdma_sai1_a;
+// Audio hardware removed: extern DMA_HandleTypeDef hdma_sai1_a;
 /* USER CODE END ExternalFunctions */
 
 /* USER CODE BEGIN 0 */
@@ -150,6 +150,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+#if 0 /* WM8978 I2C1 removed */
   if(hi2c->Instance==I2C1)
   {
     /* USER CODE BEGIN I2C1_MspInit 0 */
@@ -183,7 +184,8 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
 
     /* USER CODE END I2C1_MspInit 1 */
   }
-  else if(hi2c->Instance==I2C2)
+#endif
+  if(hi2c->Instance==I2C2)
   {
     /* USER CODE BEGIN I2C2_MspInit 0 */
 
@@ -227,6 +229,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
   */
 void HAL_I2C_MspDeInit(I2C_HandleTypeDef* hi2c)
 {
+#if 0 /* WM8978 I2C1 removed */
   if(hi2c->Instance==I2C1)
   {
     /* USER CODE BEGIN I2C1_MspDeInit 0 */
@@ -247,7 +250,8 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* hi2c)
 
     /* USER CODE END I2C1_MspDeInit 1 */
   }
-  else if(hi2c->Instance==I2C2)
+#endif
+  if(hi2c->Instance==I2C2)
   {
     /* USER CODE BEGIN I2C2_MspDeInit 0 */
 
@@ -457,6 +461,7 @@ void HAL_SPI_MspDeInit(SPI_HandleTypeDef* hspi)
 
 }
 
+#if 0 /* Audio SAI and DMA setup disabled */
 static uint32_t SAI1_client =0;
 
 void HAL_SAI_MspInit(SAI_HandleTypeDef* hsai)
@@ -529,6 +534,8 @@ void HAL_SAI_MspDeInit(SAI_HandleTypeDef* hsai)
 
     }
 }
+
+#endif
 
 /* USER CODE BEGIN 1 */
 

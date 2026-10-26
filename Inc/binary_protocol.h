@@ -27,17 +27,18 @@
 #define BP_CMD_DELETE_FILE    0x07
 #define BP_CMD_OTA_START      0x08
 #define BP_CMD_OTA_APPLY      0x09
-#define BP_CMD_PLAY_MUSIC     0x0A
+// Audio hardware removed: #define BP_CMD_PLAY_MUSIC     0x0A
 #define BP_CMD_ENABLE_DEVICE  0x0B // Replaced BP_CMD_SINGLE with BP_CMD_ENABLE_DEVICE
 #define BP_CMD_DISABLE_DEVICE 0x0C // Replaced BP_CMD_QUAD with BP_CMD_DISABLE_DEVICE
 #define BP_CMD_AUTO_STREAM    0x0D
 #define BP_CMD_TEST_IMP       0x0E // Replaced CHECK_LOSS with TEST_IMP
-#define BP_CMD_AUDIO_ROUTE    0x0F
+// Audio hardware removed: #define BP_CMD_AUDIO_ROUTE    0x0F
 #define BP_CMD_READ_PA9       0x10
 #define BP_CMD_CLEAR_DATA     0x11 // Auto clear SD card files
 #define BP_CMD_PAUSE          0x12 // Pause online streaming
 #define BP_CMD_RESUME         0x13 // Resume online streaming
 #define BP_CMD_STOP_IMP       0x14 // Stop impedance test
+// Audio hardware removed: #define BP_CMD_VOL_ADJUST     0x15 // adjust volume
 
 // Response Status
 #define BP_RESP_OK          0x00

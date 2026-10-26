@@ -8,11 +8,15 @@
 #include "ADS1299.h"
 #include "main.h"
 #include "usbd_cdc_if.h"
+#include "wireless_uart.h"
 #include "circular_buffer.h"
 #include "bsp_driver_sd.h"
 #include <string.h>
 #include <math.h>
-#include "wavplay.h"
+// Audio hardware removed: #include "wavplay.h"
+
+// 阻抗计算相关常量 (基于第一组实测数据校准)
+#define IMP_CALC_COEFF 0.048f 
 
 // --- Motion Artifact State Machine Definitions ---
 typedef enum {
@@ -82,7 +86,10 @@ extern ADC_HandleTypeDef hadc1; // Extern ADC handle
 // 外部函数/变量来自 main.c
 extern float Battery_Voltage;
 extern void Update_Battery_Voltage(void);
-extern uint8_t wm8978_initialized;
+// Audio hardware removed: extern uint8_t wm8978_initialized;
+
+extern char g_device_sn[];
+extern const char* g_device_version;
 
 // 全局配置变量
 uint8_t g_cfg_gain = 24;
@@ -362,8 +369,7 @@ cmd_response_t cmd_ota_apply_handler(char* args) {
     USB_Print("[OTA] update.bin found (%lu bytes). Shutting down for update...\r\n", fno_info.fsize);
     HAL_Delay(500); // 等待消息发送完毕
     
-    // 播放关机音效以指示 OTA 准备就绪 (使用 DEVICE_SHUTDOWN ID: 14)
-    Play_System_Audio(14);
+    // 音频硬件已移除：Play_System_Audio(14);
     
     // 执行关机/复位序列 (兼容旧项目行为)
     // 拉低 POWER_CTRL (PA4) 以切断电源
@@ -495,13 +501,7 @@ static void display_file_progress(uint32_t current, uint32_t total) {
  * @retval int 如果在超时前变为空闲返回 1，如果超时返回 0
  */
 static int usb_wait_tx_idle(uint32_t timeout_ms) {
-  USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
-  if (hcdc == NULL) return 0;
-  uint32_t start = HAL_GetTick();
-  while (hcdc->TxState != 0) {
-    if (HAL_GetTick() - start > timeout_ms) return 0;
-  }
-  return 1;
+  return Transport_WaitTxIdle(timeout_ms);
 }
 
 /**
@@ -645,9 +645,9 @@ cmd_response_t cmd_get_handler(char* args) {
     if (fr != FR_OK) break;
     if (br == 0) break;
 
-    if (CDC_Transmit_FS(buffer, (uint16_t)br) != USBD_OK) {
+    if (Transport_Transmit(buffer, (uint16_t)br) != USBD_OK) {
       uint32_t retry_start = HAL_GetTick();
-      while (CDC_Transmit_FS(buffer, (uint16_t)br) == USBD_BUSY) {
+      while (Transport_Transmit(buffer, (uint16_t)br) == USBD_BUSY) {
         if (!usb_wait_tx_idle(1000) || (HAL_GetTick() - retry_start > 2000)) {
           f_close(&SDFile);
           response.success = 0;
@@ -964,7 +964,7 @@ cmd_response_t cmd_stream_handler(char* args) {
     else if (g_cfg_sps == 8000) sps_code = 0x01;
     else if (g_cfg_sps == 16000) sps_code = 0x00;
 
-    ADS1299_Set_Sample_Parameter(sps_code, 6, 0); 
+    ADS1299_Set_Sample_Parameter(sps_code, 0, 0); 
     
     // 1.5. 如果需要，配置 CONFIG2 开启测试信号发生器
     if (g_cfg_test_sig == 1 || g_cfg_input_type == 5) {
@@ -1025,17 +1025,35 @@ cmd_response_t cmd_stream_handler(char* args) {
        HAL_Delay(5); 
     } 
     
-    // 在开始采集前播放 7.wav (COLLECT_START)
-    // 由于现在处于主循环上下文中 (延迟执行)，
-    // 调用 Play_System_Audio 是安全的。
-    Play_System_Audio(7);
     
     if (g_write_sd_enabled) {
-        // 打开用于记录的文件 (边流式传输边保存)
-        FRESULT fr = f_open(&SDFile, filename, FA_CREATE_ALWAYS | FA_WRITE);
+        // 动态生成不冲突的文件名，避免覆写大文件导致看门狗复位
+        char actual_filename[32];
+        strcpy(actual_filename, filename);
+        
+        FILINFO fno;
+        int file_idx = 1;
+        // 循环检查文件是否存在
+        while (f_stat(actual_filename, &fno) == FR_OK) {
+            char *dot = strrchr(filename, '.');
+            if (dot != NULL) {
+                int base_len = dot - filename;
+                snprintf(actual_filename, sizeof(actual_filename), "%.*s_%03d%s", base_len, filename, file_idx, dot);
+            } else {
+                snprintf(actual_filename, sizeof(actual_filename), "%s_%03d", filename, file_idx);
+            }
+            file_idx++;
+            if (file_idx > 999) break;
+        }
+
+        // 喂狗防止在长耗时的文件检查过程中复位
+        IWDG->KR = 0xAAAA;
+
+        // 打开用于记录的文件 (使用 FA_CREATE_NEW 确保不覆盖)
+        FRESULT fr = f_open(&SDFile, actual_filename, FA_CREATE_NEW | FA_WRITE);
         if (fr != FR_OK) {
             response.success = 0;
-            sprintf(response.message, "ERR: Failed to open %s (%d)", filename, fr);
+            sprintf(response.message, "ERR: Failed to open %s (%d)", actual_filename, fr);
             return response;
         }
         
@@ -1050,8 +1068,10 @@ cmd_response_t cmd_stream_handler(char* args) {
         header.has_motion = 1;
         header.data_format = 0; // INT32
         header.resolution_uv = 1000;
-        strcpy(header.device_name, "EEG_Device");
-        strcpy(header.fw_version, "V1.0");
+        
+        // 使用设备唯一的 SN 码和版本号
+        strcpy(header.device_name, g_device_sn);
+        strncpy(header.fw_version, g_device_version, 15);
         
         UINT bw;
         f_write(&SDFile, &header, sizeof(FileHeader_t), &bw);
@@ -1073,6 +1093,7 @@ cmd_response_t cmd_stream_handler(char* args) {
     // 清除坏道历史记录
     // extern uint8_t stream_bad_ch_history; // 移除了重复声明
     stream_bad_ch_history = 0;
+    // 音频硬件已移除：Play_System_Audio(7);
 
     sprintf(response.message, "OK: STREAM started. File:%s (Mask=0x%02X, Gain=%d, SPS=%d)", 
             filename, g_cfg_ch_mask, g_cfg_gain, g_cfg_sps);
@@ -1123,7 +1144,7 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
     else if (g_cfg_sps == 8000) sps_code = 0x01;
     else if (g_cfg_sps == 16000) sps_code = 0x00;
 
-    ADS1299_Set_Sample_Parameter(sps_code, 6, 0); 
+    ADS1299_Set_Sample_Parameter(sps_code, 0, 0); 
     
     // 1.5. 配置 CONFIG2 (0x02)
     ADS1299_Write_Reg(0x02, 0xC0); // 恢复为外部正常输入，清除任何内部测试信号
@@ -1166,8 +1187,7 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
     // LOFF_FLIP (0x11): 禁用电流方向翻转
     ADS1299_Write_Reg(0x11, 0x00);
 
-    // 播放提示音 7.wav (开始采集)
-    Play_System_Audio(7);
+    // 音频硬件已移除：Play_System_Audio(7);
     
     // 打开/创建目标文件
     FRESULT fr = f_open(&SDFile, filename, FA_CREATE_ALWAYS | FA_WRITE);
@@ -1190,8 +1210,8 @@ cmd_response_t cmd_auto_stream_handler(char* args) {
     header.has_motion = 1;
     header.data_format = 0; // INT32
     header.resolution_uv = 1000;
-    strcpy(header.device_name, "EEG_Device");
-    strcpy(header.fw_version, "V1.0");
+    strcpy(header.device_name, g_device_sn);
+    strncpy(header.fw_version, g_device_version, 15);
     
     UINT bw;
     f_write(&SDFile, &header, sizeof(FileHeader_t), &bw);
@@ -1236,7 +1256,7 @@ cmd_response_t cmd_conf_handler(char* args) {
     
     // 如果解析失败，使用默认值
     unsigned int mask = 0xFF;
-    int gain = 24;
+    int gain = 1;
     int sps = 250;
     int input_type = 0;
     int bias_en = 1;
@@ -1261,8 +1281,7 @@ cmd_response_t cmd_conf_handler(char* args) {
         sprintf(response.message, "OK: Config Set (Mask=0x%02X, Gain=%d, SPS=%d, Input=%d, Bias=%d)",
                 g_cfg_ch_mask, g_cfg_gain, g_cfg_sps, g_cfg_input_type, g_cfg_bias_en);
         
-        // 方案配置下发成功，播放提示音 17
-        Play_System_Audio(17);
+        // 音频硬件已移除：Play_System_Audio(17);
     } else {
         response.success = 0;
         sprintf(response.message, "ERR: Usage CONF:MASK(hex),GAIN,SPS,INPUT_TYPE,BIAS_EN");
@@ -1274,7 +1293,7 @@ cmd_response_t cmd_conf_handler(char* args) {
  * @brief 处理 POWER_TEST 指令，启动系统极限功耗测试
  * @param args 指令参数 (未使用)
  * @retval cmd_response_t 包含执行结果的响应结构体
- * @note 同时开启脑电采集、SD 卡写入、循环音频播放和 LED 常亮，以评估电池极限续航
+ * @note 同时开启脑电采集、SD 卡写入和 LED 常亮，以评估电池续航
  */
 cmd_response_t cmd_power_test_handler(char* args) {
     cmd_response_t response = {1, ""};
@@ -1308,8 +1327,8 @@ cmd_response_t cmd_power_test_handler(char* args) {
     ADS1299_Start();
     circular_buffer_clear(&ADS1299_circula_buffer);
     
-    // 3. 启动音频循环播放 (在底层实现中死循环播放 3.wav)
-    Wav_Play("AUDIO/3.wav"); 
+    // 音频硬件已移除，功耗测试不再启动 WAV 播放。
+    // Wav_Play("AUDIO/3.wav");
     
     // 4. 点亮 LED
     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET);
@@ -1319,7 +1338,7 @@ cmd_response_t cmd_power_test_handler(char* args) {
     start_time = HAL_GetTick();
     sample_count = 0;
     
-    strcpy(response.message, "OK: POWER TEST STARTED (ADS+SD+AUDIO+LED). Send STOP to end.");
+    strcpy(response.message, "OK: POWER TEST STARTED (ADS+SD+LED). Send STOP to end.");
     return response;
 }
 
@@ -1366,7 +1385,7 @@ cmd_response_t cmd_adc_test_handler(char* args) {
  * @brief 处理 STOP 指令，安全停止当前所有正在进行的任务
  * @param args 指令参数 (未使用)
  * @retval cmd_response_t 包含执行结果的响应结构体
- * @note 停止采集、关闭正在写入的文件、停止音频并返回空闲状态
+ * @note 停止采集、关闭正在写入的文件并返回空闲状态
  */
 cmd_response_t cmd_stop_handler(char* args) {
     cmd_response_t response = {1, "OK: Stopping..."};
@@ -1402,7 +1421,7 @@ cmd_response_t cmd_pause_handler(char* args) {
     if (app_state == APP_STREAM_RUNNING && g_write_sd_enabled == 0) {
         ADS1299_Stop();
         app_state = APP_STREAM_PAUSED;
-        Play_System_Audio(9); // 播放 COLLECT_PAUSE 音效
+        // 音频硬件已移除：Play_System_Audio(9);
     } else {
         response.success = 0;
         strcpy(response.message, "ERR: Only online streaming can be paused");
@@ -1421,7 +1440,7 @@ cmd_response_t cmd_resume_handler(char* args) {
     cmd_response_t response = {1, "OK: Streaming Resumed"};
     
     if (app_state == APP_STREAM_PAUSED && g_write_sd_enabled == 0) {
-        Play_System_Audio(10); // 播放 COLLECT_RESUME 音效
+        // 音频硬件已移除：Play_System_Audio(10);
         
         ADS1299_Start();
         // 注意：这里不要清空环形缓冲区，以免丢失暂停瞬间的数据
@@ -1437,33 +1456,15 @@ cmd_response_t cmd_resume_handler(char* args) {
 }
 
 /**
- * @brief 处理 STOP_IMP 指令，结束阻抗测试并进行语音播报反馈
+ * @brief 处理 STOP_IMP 指令，结束阻抗测试
  * @param args 指令参数 (未使用)
  * @retval cmd_response_t 包含执行结果的响应结构体
- * @note 评估 8 个通道的最终阻抗，若全部通过(或7个通过且平均值小于200k)播报成功，否则播报失败
+ * @note 停止 8 通道阻抗测试并恢复待机指示灯
  */
 cmd_response_t cmd_stop_imp_handler(char* args) {
     cmd_response_t response = {1, "OK: Impedance Stopped"};
     
     if (app_state == APP_IMP_TEST_ALL_RUNNING) {
-        int pass_count = 0;
-        float sum = 0.0f;
-        
-        for(int i=0; i<8; i++) {
-            if (g_latest_impedances[i] < 100000.0f) {
-                pass_count++;
-            }
-            sum += g_latest_impedances[i];
-        }
-        float avg = sum / 8.0f;
-        
-        // 成功判定标准：8个通道全通，或者至少7个通且平均阻抗小于 200kOhm
-        if (pass_count == 8 || (pass_count >= 7 && avg < 200000.0f)) {
-            Play_System_Audio(5); // 播放 IMPEDANCE_END_OK 语音
-        } else {
-            Play_System_Audio(6); // 播放 IMPEDANCE_END_FAIL 语音
-        }
-        
         ADS1299_Stop();
         app_state = APP_IDLE;
         RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_SOLID_ON); // 恢复蓝灯常亮
@@ -1532,8 +1533,7 @@ void app_run_loop(void) {
             BackupReg_Write(BKP_REG_TASK_ID, 0);
         }
         
-        // 停止采集后播放 13.wav (COLLECT_END) 提示音
-        Play_System_Audio(13);
+        // 音频硬件已移除：Play_System_Audio(13);
         
         USB_Print("Acquisition Stopped. Saved %lu samples.\r\n", sample_count);
         
@@ -1654,21 +1654,7 @@ void app_run_loop(void) {
                 motion_state_t final_state = Motion_State_Update(motion_score);
                 g_latest_motion_state = (uint8_t)final_state;
                 
-                // Trigger ARTIFACT_HIGH Audio (连续2秒最高等级 MOTION_SEVERE)
-                static uint8_t severe_consecutive_count = 0;
-                if (final_state == MOTION_SEVERE) {
-                    severe_consecutive_count++;
-                } else {
-                    severe_consecutive_count = 0;
-                }
-
-                if (severe_consecutive_count >= 2) {
-                    static uint32_t last_motion_warn = 0;
-                    if (HAL_GetTick() - last_motion_warn > 10000) { // 10秒防抖
-                        Play_System_Audio(11); // ARTIFACT_HIGH
-                        last_motion_warn = HAL_GetTick();
-                    }
-                }
+                // 音频报警已移除，运动状态仍用于数据包。
 
                 if (g_use_binary_protocol) {
                      // Binary AUX Packet (TYPE=0x05)
@@ -1704,7 +1690,7 @@ void app_run_loop(void) {
                      
                      static uint16_t aux_seq = 0;
                     uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_AUX, aux_seq++, HAL_GetTick(), aux_payload, 16);
-                    CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                    Transport_Transmit(g_bp_tx_buf, tx_len);
                      
                 } else {
                     char aux_line[128];
@@ -1713,7 +1699,7 @@ void app_run_loop(void) {
                         acc[0], acc[1], acc[2], 
                         gyro[0], gyro[1], gyro[2], 
                         batt_raw_vol, final_energy, final_state); 
-                    CDC_Transmit_FS((uint8_t*)aux_line, aux_len);
+                    Transport_Transmit((uint8_t*)aux_line, aux_len);
                 }
                 
                 last_aux_output_time = HAL_GetTick();
@@ -1942,15 +1928,38 @@ void app_run_loop(void) {
                     
                     for(int i=0; i<8; i++) {
                         float vpp = imp_all_max[i] - imp_all_min[i]; 
-                        // Z = Vpp(uV) * 1e-6 / (2 * 24nA) = Vpp / 0.048
-                        // 电流增加到 24nA 以提高信噪比
+                        
+                        // 回退到对照工程最初版本逻辑：
+                        // Z = Vpp(uV) * 1e-6 / (2 * 24nA) = Vpp / 0.048 (单位: Ohm)
                         impedances[i] = (vpp * 1e-6f) / 48.0e-9f;
 
-                        // 【新增】：硬件脱落否决逻辑
+                        // 【保护1】：硬件脱落否决逻辑 (LOFF_STATP)
                         if (imp_lead_off_flag[i]) {
                             impedances[i] = 9999000.0f; // 强行拉满到 9999 kOhm
                         }
+                    }
+                    
+                    // 【新增】：联动判定逻辑
+                    // 如果任意通道出现 9999 (脱落)，则认为当前参考可能不稳，
+                    // 此时若有通道阻抗极低 (显示为 1)，则极大概率是虚假值，同步设为 9999
+                    uint8_t has_any_leadoff = 0;
+                    for(int i=0; i<8; i++) {
+                        if (impedances[i] >= 9999000.0f) {
+                            has_any_leadoff = 1;
+                            break;
+                        }
+                    }
+                    
+                    if (has_any_leadoff) {
+                        for(int i=0; i<8; i++) {
+                            // 如果计算值换算成 kOhm 小于 1.0，且同批次有 9999，则强制设为 9999
+                            if ((impedances[i] / 1000.0f) < 1.0f) {
+                                impedances[i] = 9999000.0f;
+                            }
+                        }
+                    }
 
+                    for(int i=0; i<8; i++) {
                         g_latest_impedances[i] = impedances[i]; // 全局存储以供 STOP_IMP 评估
                         
                         // 检查是否 < 50kOhm (成功阈值)
@@ -1972,9 +1981,9 @@ void app_run_loop(void) {
                              // impedances[i] 单位为 Ohm，除以 1000 得到 kOhm
                              float imp_kohm = impedances[i] / 1000.0f;
                              
-                             // 新增逻辑：如果计算出的阻抗小于 100kOhm，则再除以 10
-                             if (imp_kohm < 100.0f) {
-                                 imp_kohm = imp_kohm / 10.0f;
+                             // 限制最低阻抗值为 1kOhm (除非是脱落)
+                             if (imp_kohm < 1.0f && impedances[i] < 9999000.0f) {
+                                 imp_kohm = 1.0f;
                              }
                              
                              if (imp_kohm > 65535.0f) imp_kohm = 65535.0f;
@@ -1983,15 +1992,16 @@ void app_run_loop(void) {
                         }
                         static uint16_t imp_seq = 0;
                         uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_IMP, imp_seq++, HAL_GetTick(), imp_payload, 16);
-                        CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                        Transport_Transmit(g_bp_tx_buf, tx_len);
                     } else {
                         char imp_buf[256];
                         int ascii_imp[8];
                         
                         for (int i=0; i<8; i++) {
                             float imp_kohm = impedances[i] / 1000.0f;
-                            if (imp_kohm < 100.0f) {
-                                imp_kohm = imp_kohm / 10.0f;
+                            // 限制最低阻抗值为 1kOhm (除非是脱落)
+                            if (imp_kohm < 1.0f && impedances[i] < 9999000.0f) {
+                                imp_kohm = 1.0f;
                             }
                             ascii_imp[i] = (int)(imp_kohm > 9999.0f ? 9999 : imp_kohm);
                         }
@@ -2019,7 +2029,7 @@ void app_run_loop(void) {
                 if (imp_window_count % 10 == 0) {
                      len = snprintf(line, sizeof(line), "DBG: Hex=0x%06X, Val=%ld, Volts=%.2f uV\r\n", 
                                     (unsigned int)(val & 0xFFFFFF), (long)val, voltage);
-                     CDC_Transmit_FS((uint8_t*)line, len);
+                     Transport_Transmit((uint8_t*)line, len);
                 }
 
                 // 更新最大/最小值
@@ -2031,17 +2041,21 @@ void app_run_loop(void) {
                 if (imp_window_count >= IMP_WINDOW_SIZE) {
                     float vpp = imp_max_val - imp_min_val; // 峰峰值电压 (单位: uV)
                     
-                    // Z = Vpp(uV) * 1e-6 / (2 * I_inj)
-                    // I_inj = 6nA = 6e-9 A (通过 LOFF 寄存器 0x01 配置 -> ILEAD_OFF=00 -> 6nA)
-                    // Z = Vpp(uV) * 1e-6 / 12e-9 = Vpp(uV) / 0.012
-                    float raw_impedance = (vpp * 1e-6f) / (2.0f * 6.0e-9f);
+                    // Z = Vpp(uV) * 1e-6 / (2 * 24nA) = Vpp / 0.048 (单位: Ohm)
+                    // 随着 CONFIG1 修改为 24nA，计算基准同步更新为 24nA
+                    float raw_impedance = (vpp * 1e-6f) / (2.0f * 24.0e-9f);
                     
                     // 无校准，使用原始阻抗
                     float impedance = raw_impedance;
                     
+                    float imp_kohm = impedance / 1000.0f;
+                    if (imp_kohm < 1.0f) {
+                        imp_kohm = 1.0f;
+                    }
+                    
                     len = snprintf(line, sizeof(line), "Z: %.2f kOhm (Vpp: %.2f uV)\r\n", 
-                                   impedance / 1000.0f, vpp);
-                    CDC_Transmit_FS((uint8_t*)line, len);
+                                   imp_kohm, vpp);
+                    Transport_Transmit((uint8_t*)line, len);
 
                     // 累加计算平均值
                     imp_sum += impedance;
@@ -2055,8 +2069,12 @@ void app_run_loop(void) {
                 
                 if (sample_count >= target_samples - 1 && imp_count > 0) {
                     double avg_imp = imp_sum / imp_count;
-                    len = snprintf(line, sizeof(line), "\r\n[TEST_IMP] Average Impedance: %.2f kOhm\r\n", avg_imp / 1000.0);
-                    CDC_Transmit_FS((uint8_t*)line, len);
+                    float avg_imp_kohm = (float)(avg_imp / 1000.0);
+                    if (avg_imp_kohm < 1.0f) {
+                        avg_imp_kohm = 1.0f;
+                    }
+                    len = snprintf(line, sizeof(line), "\r\n[TEST_IMP] Average Impedance: %.2f kOhm\r\n", avg_imp_kohm);
+                    Transport_Transmit((uint8_t*)line, len);
                 }
             }
             else if (app_state == APP_SINGLE_RUNNING) {
@@ -2067,7 +2085,7 @@ void app_run_loop(void) {
                 
                 len = snprintf(line, sizeof(line), "%.2f\n", voltage);
                 // 注意: SINGLE 模式目前不写入 SD 卡，仅根据需求为 QUAD 模式写入
-                CDC_Transmit_FS((uint8_t*)line, len);
+                Transport_Transmit((uint8_t*)line, len);
             } else if (app_state == APP_AUTO_STREAM_RUNNING) {
                 // 检查导联脱落 (正极)
                 // 状态字 0: 1100 + IN8P..IN5P
@@ -2094,12 +2112,6 @@ void app_run_loop(void) {
                      // [FIX] 不再在导联脱落时关闭通道或修改 BIAS。
                      // 仅记录坏道历史用于状态报告。硬件继续正常运行所有通道。
                      
-                     // 防抖：电极脱落报警，3秒内最多报一次
-                     static uint32_t last_loff_warn_auto = 0;
-                     if (HAL_GetTick() - last_loff_warn_auto > 3000) {
-                         Play_System_Audio(12); // ELECTRODE_LOST
-                         last_loff_warn_auto = HAL_GetTick();
-                     }
                 }
                 
                 // --- 辅助数据处理 (50Hz 采样, 1Hz 输出) 适用于 AUTO_STREAM 模式 ---
@@ -2172,14 +2184,6 @@ void app_run_loop(void) {
                     motion_state_t final_state = Motion_State_Update(motion_score);
                     g_latest_motion_state = (uint8_t)final_state;
                     
-                    // 触发 ARTIFACT_HIGH 报警音
-                    if (final_state == MOTION_SEVERE || final_state == MOTION_ARTIFACT) {
-                        static uint32_t last_motion_warn_auto = 0;
-                        if (HAL_GetTick() - last_motion_warn_auto > 10000) { // 10秒防抖
-                            Play_System_Audio(11); // ARTIFACT_HIGH
-                            last_motion_warn_auto = HAL_GetTick();
-                        }
-                    }
 
                     if (g_use_binary_protocol) {
                         uint8_t aux_payload[16];
@@ -2206,7 +2210,7 @@ void app_run_loop(void) {
 
                         static uint16_t aux_seq_auto = 0;
                         uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_AUX, aux_seq_auto++, HAL_GetTick(), aux_payload, 16);
-                        CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                        Transport_Transmit(g_bp_tx_buf, tx_len);
                     } else {
                         extern float batt_raw_vol;
                         char aux_line[128];
@@ -2215,7 +2219,7 @@ void app_run_loop(void) {
                             acc[0], acc[1], acc[2], 
                             gyro[0], gyro[1], gyro[2], 
                             batt_raw_vol, final_energy, final_state);
-                        CDC_Transmit_FS((uint8_t*)aux_line, aux_len);
+                        Transport_Transmit((uint8_t*)aux_line, aux_len);
                     }
                     
                     last_aux_output_time = HAL_GetTick();
@@ -2273,10 +2277,10 @@ void app_run_loop(void) {
                     uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, packet_ts, g_bp_payload, 47);
                     
                     // 直接发送 (无减速)
-                    uint8_t usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                    uint8_t usb_res = Transport_Transmit(g_bp_tx_buf, tx_len);
                     if (usb_res == USBD_BUSY) {
                         for(volatile int w=0; w<1000; w++); 
-                        usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                        usb_res = Transport_Transmit(g_bp_tx_buf, tx_len);
                     }
                 } else {
                     // EEG 数据传输 (替换了 LOFF 状态字符串)
@@ -2284,10 +2288,10 @@ void app_run_loop(void) {
                                    voltages[4], voltages[3], voltages[2], voltages[0],
                                    voltages[1], voltages[7], voltages[6], voltages[5]);
                     
-                    uint8_t usb_res = CDC_Transmit_FS((uint8_t*)line, len);
+                    uint8_t usb_res = Transport_Transmit((uint8_t*)line, len);
                     if (usb_res == USBD_BUSY) {
                         uint32_t retry_start = HAL_GetTick();
-                        while (CDC_Transmit_FS((uint8_t*)line, len) == USBD_BUSY) {
+                        while (Transport_Transmit((uint8_t*)line, len) == USBD_BUSY) {
                             if (HAL_GetTick() - retry_start > 2) break; 
                         }
                     }
@@ -2351,12 +2355,6 @@ void app_run_loop(void) {
                      // 累加历史记录
                      stream_bad_ch_history |= new_bad_channels;
                      
-                     // 防抖：电极脱落报警，3秒内最多报一次
-                     static uint32_t last_loff_warn = 0;
-                     if (HAL_GetTick() - last_loff_warn > 3000) {
-                         Play_System_Audio(12); // ELECTRODE_LOST
-                         last_loff_warn = HAL_GetTick();
-                     }
                 }
                 
                 float voltages[8];
@@ -2418,20 +2416,20 @@ void app_run_loop(void) {
                     uint16_t tx_len = BP_Pack(g_bp_tx_buf, BP_TYPE_EEG, bin_seq++, packet_ts, g_bp_payload, 47);
                     
                     // 直接发送 (无减速)
-                    uint8_t usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                    uint8_t usb_res = Transport_Transmit(g_bp_tx_buf, tx_len);
                     if (usb_res == USBD_BUSY) {
                          // 尝试非常短暂的忙等待
                          for(volatile int w=0; w<1000; w++); 
-                         usb_res = CDC_Transmit_FS(g_bp_tx_buf, tx_len);
+                         usb_res = Transport_Transmit(g_bp_tx_buf, tx_len);
                     }
                 } else {
 								    len = snprintf(line, sizeof(line), "EEG:C4:%.2f,C2:%.2f,CZ:%.2f,C1:%.2f,C3:%.2f,AF7:%.2f,FPZ:%.2f,AF8:%.2f\r\n",        
                                    voltages[4], voltages[3], voltages[2], voltages[0],
                                    voltages[1], voltages[7], voltages[6], voltages[5]);
-                    uint8_t usb_res = CDC_Transmit_FS((uint8_t*)line, len);
+                    uint8_t usb_res = Transport_Transmit((uint8_t*)line, len);
                     if (usb_res == USBD_BUSY) {
                         uint32_t retry_start = HAL_GetTick();
-                        while (CDC_Transmit_FS((uint8_t*)line, len) == USBD_BUSY) {
+                        while (Transport_Transmit((uint8_t*)line, len) == USBD_BUSY) {
                             if (HAL_GetTick() - retry_start > 2) break; // 2ms 超时 - 不阻塞
                         }
                     }
@@ -2628,8 +2626,7 @@ cmd_response_t cmd_test_imp_handler(char* args) {
 				HAL_Delay(5);
 		}
 
-    // 播放提示音 3.wav (开始阻抗检测)
-    Play_System_Audio(3);
+    // 音频硬件已移除：Play_System_Audio(3);
 
     // 启动采集
     ADS1299_Start();
@@ -2716,8 +2713,7 @@ cmd_response_t cmd_test_imp_all_handler(char* args) {
         USB_Print("Registers dumped (omitted for binary mode).\r\n");
     }
     
-    // 播放提示音 3.wav (开始阻抗检测)
-    Play_System_Audio(3);
+    // 音频硬件已移除：Play_System_Audio(3);
     
     // 启动采集
     ADS1299_Start();
@@ -2985,7 +2981,7 @@ cmd_response_t cmd_test_cmrr_full_handler(char* args) {
  * @brief 处理 STATE 指令，获取并打印设备当前的综合状态
  * @param args 指令参数 (未使用)
  * @retval cmd_response_t 包含执行结果的响应结构体
- * @note 上报 SN 码、版本号、电池电量、USB/SD 状态以及 ADS1299/WM8978 初始化状态
+ * @note 上报 SN 码、版本号、电池电量、USB/SD 状态以及 ADS1299 初始化状态
  */
 cmd_response_t cmd_get_state_handler(char* args) {
     cmd_response_t response = {1, ""};
@@ -3012,7 +3008,7 @@ cmd_response_t cmd_get_state_handler(char* args) {
     USB_Print("Charging:  %s\r\n", usb_ok ? "CHARGING" : "DISCHARGING");
     USB_Print("SD Card: %s\r\n", sd_mounted ? "MOUNTED" : "NOT MOUNTED");
     USB_Print("ADS1299: %s (ID: 0x%02X)\r\n", ads_ok ? "OK" : "ERROR", ads_id);
-    USB_Print("WM8978:  %s\r\n", wm8978_initialized ? "OK" : "ERROR");
+// Audio hardware removed:     USB_Print("WM8978:  %s\r\n", wm8978_initialized ? "OK" : "ERROR");
     
     USB_Print("=== END REPORT ===\r\n");
 
@@ -3026,6 +3022,7 @@ cmd_response_t cmd_get_state_handler(char* args) {
  * @retval cmd_response_t 包含执行结果的响应结构体
  * @note 仅在系统空闲时允许手动触发播放
  */
+#if 0 /* PLAYMUSIC unavailable without WM8978 */
 cmd_response_t cmd_playmusic_handler(char* args) {
     cmd_response_t response = {1, ""};
     if (args == NULL || args[0] == '\0') {
@@ -3068,6 +3065,8 @@ cmd_response_t cmd_playmusic_handler(char* args) {
     
     return response;
 }
+
+#endif
 
 /**
  * @brief 处理 TEST_RX 指令，测试 USB 接收计数功能
@@ -3196,7 +3195,7 @@ void register_all_commands(void) {
   register_command("TEST_CMRR_FULL", cmd_test_cmrr_full_handler, "TEST_CMRR_FULL:<STEP1|STEP2>", "Full CMRR Test (Two Pass)");
   register_command("TEST_RX", cmd_rx_test_handler, "TEST_RX:<START|STOP>", "Test USB RX counting 0x0303");
 	register_command("RLD_TEST", cmd_rld_test_handler, "RLD_TEST", "Test RLD suppression (10s)");
-	register_command("PLAYMUSIC", cmd_playmusic_handler, "PLAYMUSIC:<filename>", "Play .wav file in AUDIO folder (e.g. PLAYMUSIC:1)");
+// Audio hardware removed: 	register_command("PLAYMUSIC", cmd_playmusic_handler, "PLAYMUSIC:<filename>", "Play .wav file in AUDIO folder (e.g. PLAYMUSIC:1)");
 	register_command("CONF", cmd_conf_handler, "CONF:<MASK_HEX>,<GAIN>,<SPS>", "Config STREAM (e.g. FF,24,250)");
 	register_command("OTA_START", cmd_ota_start_handler, "OTA_START:<size>", "Start OTA transfer");
 	register_command("OTA_APPLY", cmd_ota_apply_handler, "OTA_APPLY", "Apply update and reset");

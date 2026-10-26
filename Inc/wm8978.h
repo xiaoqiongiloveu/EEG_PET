@@ -1,6 +1,8 @@
 #ifndef __WM8978_H
 #define __WM8978_H
 
+/* WM8978 hardware removed; declarations retained for reference. */
+#if 0
 #include "main.h"
 
 /* WM8978 Register Address */
@@ -53,4 +55,5 @@ void WM8978_EQ3_Set(uint8_t cfreq, uint8_t gain);
 void WM8978_EQ4_Set(uint8_t cfreq, uint8_t gain);
 void WM8978_EQ5_Set(uint8_t cfreq, uint8_t gain);
 
+#endif /* WM8978 hardware removed */
 #endif

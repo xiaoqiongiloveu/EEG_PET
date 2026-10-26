@@ -9,11 +9,11 @@ typedef struct {
     uint32_t toggle_interval_ms;
 } LED_Control_t;
 
-// 定义三色灯的控制数组: 0=Green(PC1), 1=Red(PA0), 2=Blue(PA3)
+// 定义三色灯的控制数组: 0=Green(PA3), 1=Red(PA2), 2=Blue(PC1)
 static LED_Control_t leds[3] = {
-    {GPIOC, GPIO_PIN_1, LED_MODE_OFF, 0, 0}, // Green
-    {GPIOA, GPIO_PIN_0, LED_MODE_OFF, 0, 0}, // Red
-    {GPIOA, GPIO_PIN_3, LED_MODE_OFF, 0, 0}  // Blue
+    {GPIOA, GPIO_PIN_3, LED_MODE_OFF, 0, 0}, // Green -> PA3
+    {GPIOA, GPIO_PIN_2, LED_MODE_OFF, 0, 0}, // Red   -> PA2
+    {GPIOC, GPIO_PIN_1, LED_MODE_OFF, 0, 0}  // Blue  -> PC1
 };
 
 /**
@@ -27,11 +27,11 @@ void RGB_LED_Init(void) {
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
     // 默认输出低电平 (灭灯)
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0 | GPIO_PIN_3, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2 | GPIO_PIN_3, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_SET);
 
-    // 配置 PA0, PA3
-    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_3;
+    // 配置 PA2, PA3
+    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;

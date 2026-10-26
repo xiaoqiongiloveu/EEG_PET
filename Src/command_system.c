@@ -5,6 +5,7 @@
 #include "fatfs.h"
 #include <stdio.h>
 #include "usbd_cdc_if.h"
+#include "wireless_uart.h"
 
 // Forward declare static variables if needed, or include headers
 // For file listing
@@ -24,7 +25,6 @@ extern "C" {
 /* Forward declaration if not in header */
 void USB_Print(const char* format, ...);
 void USB_SendString(const char* str);
-uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len); // Needed for binary response
 #ifdef __cplusplus
 }
 #endif
@@ -35,13 +35,14 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len); // Needed for binary respon
 
 // Global Flag for Pending Binary Command
 volatile uint8_t g_pending_binary_cmd = 0;
-volatile uint8_t g_audio_route = 0; // 0=Both, 1=Speaker, 2=Headphone
+// Audio hardware removed: volatile uint8_t g_audio_route = 0; // 0=Both, 1=Speaker, 2=Headphone
 // Buffer to hold filename for GET_FILE / DELETE_FILE commands (deferred)
 char g_pending_filename[64] = {0};
 // Buffer for OTA Start Size
 uint32_t g_pending_ota_size = 0;
 // Buffer for OTA CRC32
 uint32_t g_pending_ota_crc = 0;
+// Audio hardware removed: volatile uint8_t g_target_volume = 100; // 用于存储目标音量百分比 (0-100)
 
 // Helper to send binary response
 void Write_Log_To_SD(const char* log_str) {
@@ -83,7 +84,7 @@ void BP_SendResponse(uint8_t cmd_id, uint8_t status, const char* msg) {
     
     uint8_t tx_buf[128];
     uint16_t len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, HAL_GetTick(), payload, 2 + msg_len);
-    CDC_Transmit_FS(tx_buf, len);
+    Transport_Transmit(tx_buf, len);
     
     // ----- 记录二进制命令响应日志 -----
     // char log_buf[128];
@@ -168,6 +169,20 @@ void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* paylo
                  }
                  break;
 
+#if 0 /* Audio command disabled */
+            case BP_CMD_VOL_ADJUST:
+                 if (len >= 2) {
+                     extern volatile uint8_t g_target_volume;
+                     g_target_volume = payload[1];
+                     if (g_target_volume > 100) g_target_volume = 100;
+                     g_pending_binary_cmd = BP_CMD_VOL_ADJUST;
+                     BP_SendResponse(cmd_id, BP_RESP_OK, "Volume Adjust Pending");
+                 } else {
+                     BP_SendResponse(cmd_id, BP_RESP_ERR, "Missing Vol Param");
+                 }
+                 break;
+
+#endif
             case BP_CMD_GET_STATE:
             {
                  g_pending_binary_cmd = BP_CMD_GET_STATE;
@@ -225,6 +240,7 @@ void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* paylo
                  BP_SendResponse(cmd_id, BP_RESP_OK, "Auto Stream Pending");
                  break;
 
+#if 0 /* Audio command disabled */
             case BP_CMD_AUDIO_ROUTE:
                  if (len >= 2) {
                      extern volatile uint8_t g_audio_route;
@@ -236,6 +252,7 @@ void BP_Command_Callback(uint8_t type, uint16_t seq, uint32_t ts, uint8_t* paylo
                  }
                  break;
 
+#endif
             case BP_CMD_TEST_IMP:
                  g_pending_binary_cmd = BP_CMD_TEST_IMP; // Set pending impedance test
                  BP_SendResponse(cmd_id, BP_RESP_OK, "Impedance Test Pending");

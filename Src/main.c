@@ -35,8 +35,7 @@
 #include "command_system.h"
 #include "commands_impl.h"
 #include "binary_protocol.h" // Added for BP_CMD definitions
-#include "wm8978.h"
-#include "wavplay.h"
+#include "wireless_uart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,12 +56,9 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_sdmmc1;
-DMA_HandleTypeDef hdma_sai1_a;
 
-I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 
-SAI_HandleTypeDef hsai_BlockA1;
 
 SD_HandleTypeDef hsd1;
 
@@ -83,7 +79,6 @@ float batt_raw_vol = 0.0f; // Stores raw voltage in Volts for low battery check
 uint8_t low_batt_cnt = 0;  // Counter for low battery debounce
 float acc[3], gyro[3];
 uint32_t last_qmi_print = 0;
-uint8_t wm8978_initialized = 0;
 
 /* USER CODE END PV */
 
@@ -92,9 +87,7 @@ void SystemClock_Config(void);
 void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
-static void MX_SAI1_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_DMA_Init(void);
@@ -115,7 +108,7 @@ uint32_t BackupReg_Read(uint32_t index);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 char g_device_sn[24] = {0};
-const char* g_device_version = "T1.0.3";
+const char* g_device_version = "T4.1.0";
 
 /**
   * @brief  生成动态设备序列号(SN)
@@ -154,7 +147,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   * @brief  SD卡初始化与挂载处理流程
   * @note   该函数负责初始化FatFs文件系统、挂载SD卡，并执行一次基础的文件读写测试。
   *         同时，它还会检查并清理遗留的OTA升级文件(update.bin)，防止设备陷入无限升级循环。
-  *         如果挂载失败，将通过音频系统播报设备错误提示音。
+  *         如果挂载失败，将通过 USB 输出错误信息。
   */
 void SD_Init_Process(void)
 {
@@ -171,7 +164,6 @@ void SD_Init_Process(void)
     if(res != FR_OK)
     {
         USB_Print("[SD] Mount Failed! Error: %d\r\n", res);
-        Play_System_Audio(16); // DEVICE_ERROR
         return;
     }
     USB_Print("[SD] Mount Success!\r\n");
@@ -241,7 +233,7 @@ void SD_Init_Process(void)
 void User_BSP_Init(void)
 {
     // 1. 电源控制初始化 (必须最先执行，防止断电)
-    Power_Control_Init();
+    // Power_Control_Init(); 
     
     // 2. 软件I2C初始化 (目前暂无挂载的传感器，保留接口)
     Soft_I2C_Init();
@@ -254,12 +246,16 @@ void User_BSP_Init(void)
   *         2. ADS1299 高精度脑电ADC芯片
   *         3. QMI8658 六轴姿态传感器
   *         4. SD卡与FatFs文件系统
-  *         5. WM8978 音频编解码芯片 (配置为DAC耳机输出模式)
-  *         若关键芯片初始化失败，将触发错误报警音。
   */
 void User_Device_Init(void)
 {
-    // 1. 初始化环形缓冲区 (接收ADS1299数据必备)
+    // 0. RGB LED 硬件引脚初始化
+    RGB_LED_Init();
+
+    // 1. BSP 板级基础初始化 (电源控制、软件I2C)
+    Power_Control_Init();
+
+    // 2. 初始化环形缓冲区 (接收ADS1299数据必备)
     circular_buffer_init(&ADS1299_circula_buffer, CIRCULAR_BUFFER_MAX_SIZE);
 
     // 2. 初始化 ADS1299 脑电模拟前端
@@ -267,7 +263,7 @@ void User_Device_Init(void)
     ADS1299_Init();
     uint8_t ads_id = ADS1299_ReadRegister(0x00);
     if ((ads_id & 0x1F) != 0x1E) {
-        Play_System_Audio(16); // DEVICE_ERROR
+        USB_Print("[BOOT] ADS1299 ID check failed: 0x%02X\r\n", ads_id);
     }
     
     // 3. 初始化 QMI8658 六轴姿态传感器
@@ -276,7 +272,6 @@ void User_Device_Init(void)
         USB_Print("[BOOT] QMI8658 Init Success (ID=0x05)\r\n");
     } else {
         USB_Print("[BOOT] QMI8658 Init Failed!\r\n");
-        Play_System_Audio(16); // DEVICE_ERROR
     }
     
     // 4. 初始化 SD卡 与 FatFs
@@ -289,24 +284,6 @@ void User_Device_Init(void)
         check_filesystem_impl();
     }
 
-    // 5. 初始化 WM8978 音频编解码器
-    USB_Print("[BOOT] Initializing WM8978...\r\n");
-    if (WM8978_Init() == 0) {
-        wm8978_initialized = 1;
-        USB_Print("[BOOT] WM8978 Init Success!\r\n");
-        
-        // 为耳机输出配置基础DAC参数
-        WM8978_ADDA_Cfg(1, 0);      // 开启 DAC, 关闭 ADC
-        WM8978_Write_Reg(11, 0xFF); // 设置数字音量最大
-        
-        WM8978_Input_Cfg(0, 0, 0);  // 关闭所有输入通道
-        WM8978_Output_Cfg(1, 0);    // 开启 DAC 输出
-        WM8978_HPvol_Set(63, 63);   // 耳机音量设置为最大 (63)
-        WM8978_SPKvol_Set(63);      // 喇叭音量设置为最大 (63)
-    } else {
-        wm8978_initialized = 0;
-        USB_Print("[BOOT] WM8978 Init Failed!\r\n");
-    }
 }
 
 /**
@@ -324,7 +301,7 @@ void User_App_Init(void)
   * @brief  主程序入口 (Main Loop)
   * @retval int 程序的退出状态 (嵌入式系统中通常不会返回)
   * @note   系统启动的总控流程，包含底层硬件配置、看门狗初始化、热启动任务恢复逻辑，
-  *         以及死循环中的设备状态轮询、USB指令解析、音频状态机刷新等。
+  *         以及死循环中的设备状态轮询、USB 指令解析和采集处理。
   */
 // 声明全局变量，用于缓存SD卡使用百分比
 uint8_t g_sd_usage_percent = 0;
@@ -385,21 +362,20 @@ int main(void)
   
   MX_DMA_Init();
   MX_ADC1_Init();
-  MX_I2C1_Init();
   // MX_I2C2_Init();
-  MX_SAI1_Init();
   MX_SDMMC1_SD_Init();
   MX_SPI1_Init();
   MX_FATFS_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  Wireless_UART_Init();
   // 0. RGB LED 硬件引脚初始化
   RGB_LED_Init();
 
   // 1. BSP 板级基础初始化 (电源控制、软件I2C)
   User_BSP_Init();
 
-  // 2. 核心业务外设与传感器初始化 (ADS1299, QMI8658, SD, Audio)
+  // 2. 核心业务外设与传感器初始化 (ADS1299, QMI8658, SD)
   User_Device_Init();
   
   // --- 开机仅执行一次：基于MCU UID生成唯一的动态SN码 ---
@@ -408,6 +384,9 @@ int main(void)
 
   // 3. 应用层初始化 (注册CLI命令行与协议缓存)
   User_App_Init();
+//  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET); // 目标引脚1: PC1 (当前点亮)
+//  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_RESET);   // 目标引脚2: PA2
+//  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);   // 目标引脚3: PA3
 
   // 4. 热启动任务恢复逻辑 (应对死机复位后的无缝恢复)
   if (BackupReg_Read(BKP_REG_MAGIC) == BKP_MAGIC_NUMBER) {
@@ -453,15 +432,13 @@ int main(void)
   USB_Print("   DEVICE SN: %s              \r\n", g_device_sn);
   USB_Print("=================================\r\n");
   
-  // 初始化完成后，播放开机欢迎语音 (DEVICE_BOOT, ID: 1)
-  Play_System_Audio(1);
   
   /* USER CODE END 2 */
 
   /* 无限循环 */
   /* USER CODE BEGIN WHILE */
   
-  // 初始化默认状态：开机默认蓝灯中速闪烁
+  // 初始化默认状态：开机完成后显示蓝色常亮
   RGB_LED_SetSingle(LED_COLOR_BLUE, LED_MODE_SOLID_ON);
   
   while (1)
@@ -470,6 +447,7 @@ int main(void)
     
     // --- 处理 RGB 三色灯的非阻塞状态机 ---
     RGB_LED_Process();
+    Wireless_UART_Poll();
     
     /* USER CODE END WHILE */
 
@@ -477,6 +455,7 @@ int main(void)
     // 1. 处理通过USB接收到的串口命令
     if (usb_cmd_ready) {
         usb_cmd_ready = 0;
+        Wireless_UART_SelectUSB();
         process_command_ex(usb_cmd_buffer);
     }
 
@@ -507,39 +486,32 @@ int main(void)
              extern uint8_t g_sd_usage_percent;
              status_payload[1] = g_sd_usage_percent; // SD卡已用空间百分比 (0-100) 从全局变量读取
              status_payload[2] = 1; // SD卡 状态正常
-             uint16_t bat_mv = 415; // 4.15V (模拟值，应当替换为真实的ADC读取值)
+             
+             extern float batt_raw_vol;
+             extern void Update_Battery_Voltage(void);
+             Update_Battery_Voltage(); // 确保获取到最新的电量
+             uint16_t bat_mv = (uint16_t)(batt_raw_vol * 100.0f); // 转换为10mV单位，例如 4.15V -> 415
+             
              status_payload[3] = bat_mv & 0xFF;
              status_payload[4] = (bat_mv >> 8) & 0xFF;
              
              extern volatile uint8_t g_task_state;
              extern uint32_t g_task_id;
              extern volatile uint8_t g_usb_host_connected;
-             static uint8_t last_usb_state = 0;
              
              uint8_t dev_state = 0;
              
              // 状态逻辑判定
              if (g_usb_host_connected == 0) {
                  dev_state = 4; // 未连接 (闲置的小神探端口)
-                 last_usb_state = 0;
              } 
              else if (g_task_state == 1 || g_task_state == 2) {
                  dev_state = 3; // 进行中 (包括任务倒计时和进行中)
                  
-                 // 如果在任务进行中刚刚建立连接，播放连接成功提示音
-                 if (!last_usb_state) {
-                     last_usb_state = 1;
-                     Play_System_Audio(2);
-                 }
              } 
              else if (g_task_state == 99) { // 假设99是一个特殊的“已停用”标志位
                  dev_state = 5; // 已停用
                  
-                 // 如果刚刚建立连接，播放连接成功提示音
-                 if (!last_usb_state) {
-                     last_usb_state = 1;
-                     Play_System_Audio(2);
-                 }
              } 
              else {
                  // 已连接且处于空闲状态
@@ -549,20 +521,21 @@ int main(void)
                      dev_state = 2; // 电量低 (已连接，电量<60%)
                  }
                  
-                 // 如果刚刚建立连接，播放连接成功提示音
-                 if (!last_usb_state) {
-                     last_usb_state = 1;
-                     Play_System_Audio(2);
-                 }
              }
              
              status_payload[5] = dev_state;
              memcpy(&status_payload[6], &g_task_id, 4);
              
+             // 增加 PB4 PB5 状态读取
+             uint8_t pb_status = 0;
+             if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) pb_status |= 0x01; // Bit 0: PB4
+             if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) pb_status |= 0x02; // Bit 1: PB5
+             status_payload[10] = pb_status;
+             
              const char* ver = g_device_version;
              const char* sn = g_device_sn;
              
-             int offset = 10;
+             int offset = 11;
              strcpy((char*)&status_payload[offset], ver);
              offset += strlen(ver) + 1; // 包含 null 终止符作为分隔
              
@@ -571,29 +544,8 @@ int main(void)
              
              uint8_t tx_buf[128];
             uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_STATUS, 0, HAL_GetTick(), status_payload, offset); // 注意：此处是异步发送，Seq固定为0
-            CDC_Transmit_FS(tx_buf, tx_len);
+            Transport_Transmit(tx_buf, tx_len);
              
-             // 基于PB3电平跳变的音频输出切换逻辑
-             uint8_t current_pb3 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3);
-             static uint8_t last_pb3_state = 0xFF; // 静态变量，跨函数调用保持状态
-              if (current_pb3 != last_pb3_state) {
-                  // 重新运行完整的初始化序列以确保信号路径完全恢复
-                  if (WM8978_Init() == 0) {
-                      WM8978_ADDA_Cfg(1, 0);      // 开启 DAC, 关闭 ADC
-                      WM8978_Write_Reg(11, 0xFF); // 数字音量最大
-                      WM8978_Input_Cfg(0, 0, 0);  // 关闭所有输入
-                      WM8978_Output_Cfg(1, 0);    // 开启 DAC 输出
-                      
-                      if (current_pb3 == 0) { // 低电平 = 喇叭 (未插入耳机 或 硬件反相逻辑)
-                           WM8978_HPvol_Set(0, 0);    // 静音耳机
-                           WM8978_SPKvol_Set(63);     // 喇叭音量最大 (0-63 范围)
-                       } else { // 高电平 = 耳机 (已插入耳机 或 硬件反相逻辑)
-                           WM8978_HPvol_Set(63, 63); // 耳机音量最大 (0-63 范围)
-                           WM8978_SPKvol_Set(0);      // 静音喇叭
-                       }
-                  }
-                  last_pb3_state = current_pb3;
-              }
         }
         else if (cmd == BP_CMD_STOP_STREAM) {
              extern cmd_response_t cmd_stop_handler(char*);
@@ -649,19 +601,6 @@ int main(void)
              // 如果没有参数，默认使用 "EEG_DATA.TXT"
              cmd_auto_stream_handler("EEG_DATA.TXT");
         }
-        else if (cmd == BP_CMD_AUDIO_ROUTE) {
-             extern volatile uint8_t g_audio_route;
-             if (g_audio_route == 0) { // 喇叭和耳机同时输出
-                 WM8978_SPKvol_Set(63);
-                 WM8978_HPvol_Set(63, 63);
-             } else if (g_audio_route == 1) { // 仅喇叭输出
-                 WM8978_HPvol_Set(0, 0); // 静音耳机
-                 WM8978_SPKvol_Set(63);  // 取消喇叭静音
-             } else if (g_audio_route == 2) { // 仅耳机输出
-                 WM8978_SPKvol_Set(0);   // 静音喇叭
-                 WM8978_HPvol_Set(63, 63); // 取消耳机静音
-             }
-        }
         else if (cmd == BP_CMD_LIST_FILES) {
              // 列出文件
              DIR dir;
@@ -691,7 +630,7 @@ int main(void)
                  memcpy(&payload[2], file_list, offset);
                 
                 uint16_t tx_len = BP_Pack(tx_buf, BP_TYPE_CMD_RESP, 0, HAL_GetTick(), payload, 2 + offset);
-                CDC_Transmit_FS(tx_buf, tx_len);
+                Transport_Transmit(tx_buf, tx_len);
              } else {
                  BP_SendResponse(BP_CMD_LIST_FILES, BP_RESP_ERR, "Open Dir Failed");
              }
@@ -797,12 +736,19 @@ int main(void)
                     uint8_t tx_buf[300];
                      uint16_t tx_len = BP_Pack(tx_buf, 0x20, seq++, HAL_GetTick(), read_buf, br); // 0x20 = OTA/文件类型
                      
-                     uint8_t res = CDC_Transmit_FS(tx_buf, tx_len);
-                      if (res == USBD_BUSY) {
-                          HAL_Delay(2); // 稍作等待
-                          res = CDC_Transmit_FS(tx_buf, tx_len);
-                      }
-                      
+                     uint32_t send_start = HAL_GetTick();
+                     uint8_t sent = 0;
+                     while (!sent) {
+                         if (Transport_Transmit(tx_buf, tx_len) == USBD_OK) {
+                             sent = 1;
+                             break;
+                         }
+                         IWDG->KR = 0xAAAA;
+                         if (HAL_GetTick() - send_start > 1000) break;
+                         HAL_Delay(1);
+                     }
+                     if (!sent) break;
+
                       sent_bytes += br;
                  }
                  f_close(&SDFile);
@@ -817,10 +763,6 @@ int main(void)
      }
     
     // --- 恢复原有 Main 函数中的逻辑 ---
-    // 处理音频播放状态机
-    extern void Wav_Process(void);
-    Wav_Process(); 
-    
     // 检查关机按键 (硬件关机的重要逻辑!)
     extern void Check_Power_Off(void);
     Check_Power_Off(); 
@@ -931,9 +873,8 @@ void PeriphCommonClock_Config(void)
 
   /** Initializes the peripherals clock
   */
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_SAI1|RCC_PERIPHCLK_USB
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB
                               |RCC_PERIPHCLK_SDMMC1|RCC_PERIPHCLK_ADC;
-  PeriphClkInit.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PLLSAI1;
   PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
   PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLLSAI1;
   PeriphClkInit.Sdmmc1ClockSelection = RCC_SDMMC1CLKSOURCE_PLLSAI1;
@@ -943,7 +884,7 @@ void PeriphCommonClock_Config(void)
   PeriphClkInit.PLLSAI1.PLLSAI1P = RCC_PLLP_DIV2;
   PeriphClkInit.PLLSAI1.PLLSAI1Q = RCC_PLLQ_DIV2;
   PeriphClkInit.PLLSAI1.PLLSAI1R = RCC_PLLR_DIV2;
-  PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_SAI1CLK|RCC_PLLSAI1_48M2CLK
+  PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_48M2CLK
                               |RCC_PLLSAI1_ADC1CLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
@@ -1014,6 +955,7 @@ static void MX_ADC1_Init(void)
   * @param None
   * @retval None
   */
+#if 0 /* WM8978 I2C peripheral removed */
 static void MX_I2C1_Init(void)
 {
 
@@ -1056,6 +998,8 @@ static void MX_I2C1_Init(void)
   /* USER CODE END I2C1_Init 2 */
 
 }
+
+#endif
 
 /**
   * @brief I2C2 Initialization Function
@@ -1110,6 +1054,7 @@ static void MX_I2C2_Init(void)
   * @param None
   * @retval None
   */
+#if 0 /* Audio SAI peripheral removed */
 static void MX_SAI1_Init(void)
 {
 
@@ -1145,6 +1090,8 @@ static void MX_SAI1_Init(void)
   /* USER CODE END SAI1_Init 2 */
 
 }
+
+#endif
 
 /**
   * @brief SDMMC1 Initialization Function
@@ -1240,7 +1187,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, G_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, POWER_CTRL_Pin|GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, POWER_CTRL_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10|GPIO_PIN_11, GPIO_PIN_RESET);
@@ -1255,7 +1202,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pins : POWER_CTRL_Pin */
-  GPIO_InitStruct.Pin = POWER_CTRL_Pin|GPIO_PIN_10;
+  GPIO_InitStruct.Pin = POWER_CTRL_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -1281,10 +1228,10 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* Configure PB3 as Input (Disable JTAG JTDO, keep SWD) */
-  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  /* Configure PB4 and PB5 as Input for Charge Chip Status */
+  GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL; // 根据外部电路可改为 GPIO_PULLUP/DOWN
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
@@ -1338,17 +1285,20 @@ static void MX_IWDG_Init(void) {
 }
 
 void Power_Control_Init(void) {
+    // 立即点亮三色灯 (合成为白色) 作为开机反馈
+    // 根据推导：PC1=蓝, PA2=红, PA3=绿
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET); 
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_RESET); 
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET); 
+
     // Hot-Start Check: If Magic Number exists in Backup Register, latch power immediately
     if (BackupReg_Read(BKP_REG_MAGIC) == BKP_MAGIC_NUMBER) {
         HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET);
         USB_Print("[PWR] Hot Start Detected. Power Latch Restored.\r\n");
         return;
     }
 
     // Normal Start: Check Power Key (PA1) - Active Low
-    // Note: PA1 is configured as INPUT in MX_GPIO_Init
-    
     if (HAL_GPIO_ReadPin(POWER_KEY_GPIO_Port, POWER_KEY_Pin) == GPIO_PIN_RESET) {
         HAL_Delay(20); // 20ms debounce
         if (HAL_GPIO_ReadPin(POWER_KEY_GPIO_Port, POWER_KEY_Pin) == GPIO_PIN_RESET) {
@@ -1357,7 +1307,6 @@ void Power_Control_Init(void) {
                 if (HAL_GetTick() - press_start >= 2000) {
                     // Confirm press for 2 seconds -> Power ON
                     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_SET); // Latch Power (PA4 High)
-                    HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_RESET); // LED On (Active Low) -> Moved to main loop for blinking
                     
                     // Mark as "Powered On" in Backup Register to allow Hot-Start recovery
                     BackupReg_Write(BKP_REG_MAGIC, BKP_MAGIC_NUMBER);
@@ -1366,8 +1315,6 @@ void Power_Control_Init(void) {
             }
         }
     }
-    // If not pressed for 2 seconds, do not latch power.
-    // Power will cut off when button is released.
 }
 
 void Check_Power_Off(void) {
@@ -1383,25 +1330,31 @@ void Check_Power_Off(void) {
             while (HAL_GPIO_ReadPin(POWER_KEY_GPIO_Port, POWER_KEY_Pin) == GPIO_PIN_RESET) {
                 // 在这里需要继续调用 RGB_LED_Process，否则 while 循环会阻塞灯的翻转
                 RGB_LED_Process();
+                IWDG->KR = 0xAAAA; // 必须喂狗，防止长按期间复位
                 
                 if (HAL_GetTick() - press_start >= 2000) {
                     // Confirm press for 2 seconds -> Power OFF
                     
-                    // Play 14.wav (DEVICE_SHUTDOWN) before power off
-                    Play_System_Audio(14);
-                    
-                    // 等待音频播放完毕，期间持续搬运数据，防止提前断电导致没有声音
-                    extern uint8_t is_playing;
-                    extern void Wav_Process(void);
-                    while(is_playing) {
-                        Wav_Process();
+                    // 强制停止当前正在运行的任务 (脑电采集/阻抗测试等)
+                    if (app_state != APP_IDLE) {
+                        ADS1299_Stop();
                     }
+                    
+                    // 显式关闭 SD 卡文件，防止数据损坏
+                    f_close(&SDFile);
+                    
+                    // 同步状态机与备份寄存器
+                    app_state = APP_IDLE;
+                    extern volatile uint8_t g_task_state;
+                    g_task_state = 0;
+                    
+                    BackupReg_Write(BKP_REG_MAGIC, 0);
+                    BackupReg_Write(BKP_REG_TASK_STATE, 0);
+                    BackupReg_Write(BKP_REG_TASK_ID, 0);
                     
                     HAL_GPIO_WritePin(LED_1_GPIO_Port, LED_1_Pin, GPIO_PIN_SET); // LED Off
                     
-                    // Clear Magic Number before manual power off
-                    BackupReg_Write(BKP_REG_MAGIC, 0);
-                    
+                    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET); // WiFi module power off (active low)
                     HAL_GPIO_WritePin(POWER_CTRL_GPIO_Port, POWER_CTRL_Pin, GPIO_PIN_RESET); // Unlatch Power (PA4 Low)
                     
                     extern volatile uint8_t g_usb_host_connected;
@@ -1425,9 +1378,9 @@ void Update_Battery_Voltage(void) {
     if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK) {
         uint32_t raw = HAL_ADC_GetValue(&hadc1);
         
-        // Use user-defined calibration formula
-        // Updated formula based on 4.2V (Raw 4031) and 3.7V (Raw 3519) measurements
-        float voltage = ((float)raw * 0.00097656f) + 0.2635f;
+        // Based on 50% divider (10k/10k) and VREF+ = 3.3V
+        // Formula: (raw / 4095.0) * 3.3 * 2 (Divider Ratio)
+        float voltage = (float)raw * 0.00161172f;
         
         batt_raw_vol = voltage; // Update raw voltage for low battery check
         
@@ -1444,17 +1397,10 @@ void Update_Battery_Voltage(void) {
 }
 
 void Low_Battery_Check(void) {
-    static uint32_t last_bat_warn = 0;
     // 假设20%电量阈值约为3.5V
     if (batt_raw_vol > 0 && batt_raw_vol < 3.5f) {
         low_batt_cnt++;
         if (low_batt_cnt > 5) { // 连续5次低电
-            // 每隔5分钟(300000ms)报一次警
-            if (HAL_GetTick() - last_bat_warn > 300000 || last_bat_warn == 0) {
-                Play_System_Audio(15); // BATTERY_LOW
-                last_bat_warn = HAL_GetTick();
-            }
-            
             // Turn on Red LED (Highest Priority)
             RGB_LED_SetSingle(LED_COLOR_RED, LED_MODE_FLASH_FAST);
             
@@ -1477,6 +1423,11 @@ void Send_AUX_Packet(float *acc, float *gyro, float vbat) {
 
 void USB_SendString(const char* str) {
     if (str) {
+        if (Wireless_UART_IsSelected()) {
+            if (!Transport_WaitTxIdle(100)) return;
+            Transport_Transmit((uint8_t*)str, strlen(str));
+            return;
+        }
         USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
         if (hcdc == NULL) return;
 
@@ -1485,7 +1436,7 @@ void USB_SendString(const char* str) {
         while (hcdc->TxState != 0) {
             if (HAL_GetTick() - start > 100) return; // Timeout 100ms
         }
-        CDC_Transmit_FS((uint8_t*)str, strlen(str));
+        Transport_Transmit((uint8_t*)str, strlen(str));
     }
 }
 
@@ -1501,22 +1452,14 @@ void USB_Print(const char* format, ...) {
 
     static char buffer[256]; // Use static buffer to ensure memory validity during DMA/Interrupt transfer
     
-    USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
-    if (hcdc == NULL) return;
-
-    // Wait until USB is free BEFORE writing to the shared static buffer
-    // This prevents overwriting data that is currently being sent
-    uint32_t start = HAL_GetTick();
-    while (hcdc->TxState != 0) {
-        if (HAL_GetTick() - start > 100) return; // Timeout 100ms
-    }
+    if (!Transport_WaitTxIdle(100)) return;
 
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     
-    CDC_Transmit_FS((uint8_t*)buffer, strlen(buffer));
+    Transport_Transmit((uint8_t*)buffer, strlen(buffer));
 }
 
 void Send_EEG_Packet(uint8_t *raw_27_bytes) {
@@ -1556,9 +1499,6 @@ static void MX_DMA_Init(void)
   __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
-  /* DMA2_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 1, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Channel1_IRQn);
   /* DMA2_Channel4_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Channel4_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA2_Channel4_IRQn);

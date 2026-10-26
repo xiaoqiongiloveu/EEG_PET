@@ -23,6 +23,7 @@
 
 /* USER CODE BEGIN INCLUDE */
 #include "binary_protocol.h" // New Protocol
+#include "wireless_uart.h"
 #include <string.h>
 /* USER CODE END INCLUDE */
 
@@ -278,9 +279,10 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   
   // File Transfer Hook
   if (g_file_transfer_mode) {
-      handle_file_transfer(Buf, *Len);
+      if (!Wireless_UART_IsSelected()) handle_file_transfer(Buf, *Len);
       return (USBD_OK);
   }
+  Wireless_UART_SelectUSB();
   
   // Initialize Binary Parser
   static uint8_t parser_initialized = 0;

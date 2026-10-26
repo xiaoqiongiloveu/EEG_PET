@@ -18,7 +18,7 @@ typedef enum {
 
 typedef enum {
     LED_COLOR_GREEN = 0,  // PC1
-    LED_COLOR_RED,        // PA0
+    LED_COLOR_RED,        // PA2
     LED_COLOR_BLUE        // PA3
 } LED_Color_t;
 

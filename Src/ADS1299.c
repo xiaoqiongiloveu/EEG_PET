@@ -16,7 +16,7 @@ static uint8_t spi_tx_buf[30];
 static uint8_t spi_rx_buf[30];
 uint8_t ADS1299_REG[24];
 uint8_t ADS1299_REGt[24];
-uint8_t pga = 12;
+uint8_t pga = 1;
 
 void ADS1299_SPI_RW(uint8_t *tx_data, uint8_t *rx_data, uint8_t len)
 {
@@ -97,7 +97,7 @@ void ADS1299_Init(void)
     USB_Print("[ADS1299] Device ID Read: 0x%02X\r\n", id);
 
     ADS1299_REG[0x00] = 0x1C;
-    ADS1299_REG[0x01] = 0x96;
+    ADS1299_REG[0x01] = 0x96; // 0x96: 24nA, 0x92: 6nA. Changed to 24nA as requested
     ADS1299_REG[0x02] = 0xC0;
     ADS1299_REG[0x03] = 0xEC; // 
     ADS1299_REG[0x04] = 0x00;
@@ -112,7 +112,7 @@ void ADS1299_Init(void)
     ADS1299_REG[0x0C] = 0x60;
 
     ADS1299_REG[0x0D] = 0xFF; // FF : all p to RLD bias
-    ADS1299_REG[0x0E] = 0xFF; // 
+    ADS1299_REG[0x0E] = 0x00; // 0x00
     ADS1299_REG[0x0F] = 0x00; //
     ADS1299_REG[0x10] = 0x00; //
     ADS1299_REG[0x11] = 0x00; // Lead-Off Current Direction
@@ -175,7 +175,7 @@ void ADS1299_Set_Sample_Parameter(uint8_t dr, uint8_t gain, uint8_t input_type) 
     ch_settings |= ((gain & 0x07) << 4);     // Set Gain
     ch_settings |= (input_type & 0x07);      // Set Input Type (MUX)
     
-    for(int i = 1; i < 8; i++) {
+    for(int i = 0; i < 8; i++) {
         ADS1299_Write_Reg(ADS1299_CH1SET + i, ch_settings);
     }
 }

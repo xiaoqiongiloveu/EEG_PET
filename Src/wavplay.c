@@ -1,3 +1,5 @@
+/* Audio hardware removed; implementation retained for reference. */
+#if 0
 #include "wavplay.h"
 #include "wm8978.h"
 #include "usb_device.h" // For USB_Print
@@ -326,6 +328,7 @@ void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai) {
  * @param audio_id: 1-16 corresponding to audio filenames
  */
 void Play_System_Audio(uint8_t audio_id) {
+    return; // 全局禁用语音播报，实现快速静音
     // Constraint 2: Disable ALL audio playback DURING offline collection
     // to avoid SD card write conflicts and EEG interference.
     // However, if the device is shutting down (14), or collection has just ended (13),
@@ -345,3 +348,5 @@ void Play_System_Audio(uint8_t audio_id) {
     // 移除了死循环阻塞，改为异步播放
     // 播放缓冲区的填充将在主循环中通过 Wav_Process() 完成
 }
+
+#endif

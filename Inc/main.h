@@ -62,6 +62,11 @@ uint32_t BackupReg_Read(uint32_t index);
 /* Private defines -----------------------------------------------------------*/
 #define LED_1_Pin GPIO_PIN_1
 #define LED_1_GPIO_Port GPIOC
+#define LED_2_Pin GPIO_PIN_2
+#define LED_2_GPIO_Port GPIOA
+#define LED_3_Pin GPIO_PIN_3
+#define LED_3_GPIO_Port GPIOA
+
 #define KEY_PWR_Pin GPIO_PIN_1
 #define KEY_PWR_GPIO_Port GPIOA
 #define ADS1299_SCK_Pin GPIO_PIN_5

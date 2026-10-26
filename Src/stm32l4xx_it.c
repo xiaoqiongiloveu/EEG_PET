@@ -57,7 +57,7 @@
 /* External variables --------------------------------------------------------*/
 extern PCD_HandleTypeDef hpcd_USB_FS;
 extern DMA_HandleTypeDef hdma_sdmmc1;
-extern DMA_HandleTypeDef hdma_sai1_a;
+// Audio hardware removed: extern DMA_HandleTypeDef hdma_sai1_a;
 extern SD_HandleTypeDef hsd1;
 /* USER CODE BEGIN EV */
 
@@ -241,6 +241,7 @@ void SDMMC1_IRQHandler(void)
 /**
   * @brief This function handles DMA2 channel1 global interrupt.
   */
+#if 0 /* Audio DMA disabled */
 void DMA2_Channel1_IRQHandler(void)
 {
   /* USER CODE BEGIN DMA2_Channel1_IRQn 0 */
@@ -255,6 +256,8 @@ void DMA2_Channel1_IRQHandler(void)
 /**
   * @brief This function handles DMA2 channel4 global interrupt.
   */
+#endif
+
 void DMA2_Channel4_IRQHandler(void)
 {
   /* USER CODE BEGIN DMA2_Channel4_IRQn 0 */

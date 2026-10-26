@@ -1,3 +1,5 @@
+/* Audio hardware removed; implementation retained for reference. */
+#if 0
 #include "wm8978.h"
 #include "main.h"
 
@@ -301,3 +303,5 @@ void WM8978_EQ5_Set(uint8_t cfreq, uint8_t gain)
     regval |= gain;
     WM8978_Write_Reg(22, regval);
 }
+
+#endif
